@@ -376,13 +376,26 @@ button:disabled {
 }
 
 // A screen whose last element is an action row puts it at the foot rather than
-// leaving it stranded under the fields with the rest of the popup empty.
-.page > form {
+// leaving it stranded under the fields with the rest of the popup empty. Only
+// for a form that owns the whole screen, though — Plasma and Stake each hold
+// just the amount field, with their submit button and a list of entries
+// living outside it, so this rule made the form itself stretch to fill
+// whatever the (still loading) list beneath had not claimed yet: the button
+// sat near the bottom of an empty page and then jumped up once the list's
+// real height came in. `.page > form.fields-only` opts back out.
+.page > form:not(.fields-only) {
   display: flex;
   flex-direction: column;
   gap: 10px;
   flex: 1;
   min-height: 0;
+}
+
+// Sized to its fields, not to the page — see above.
+.page > form.fields-only {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .section-title {
@@ -1016,6 +1029,12 @@ button:disabled {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  // A <button>'s user-agent default is centered text and a few pixels of its
+  // own padding — the padding is what actually pulled the amount and ticker
+  // in from the left edge that `.balance-total` (a plain, unpadded div) sits
+  // flush against; neither is trusted to the flex column above.
+  text-align: left;
+  padding: 0;
   gap: 1px;
   flex: 1;
   min-width: 0;
@@ -1045,22 +1064,36 @@ button:disabled {
   }
 }
 
-.balance-address {
+// Ticker and its live USD value, on the one line, under the amount.
+.balance-meta {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  align-self: flex-start;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.balance-usd {
+  font-size: var(--step-0);
+  font-weight: 400;
   color: var(--text-dim);
-  font-size: 12px;
   font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
-  &:hover {
-    color: var(--text);
-  }
-
-  img {
-    opacity: 0.5;
-  }
+// What the ZNN and QSR balances above are worth together, in the spot the
+// account's own address used to sit — that is also shown in the header's
+// account pill, so it only ever duplicated it here. The one figure on this
+// card meant to be read at a glance rather than studied, so it gets the
+// lightest weight here and the largest size of the two USD figures — bigger,
+// but never competing with the bold ZNN/QSR amounts above it.
+.balance-total {
+  align-self: flex-start;
+  color: var(--text);
+  font-size: var(--step-2);
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
 }
 
 // Only rendered when there is something pending, so it never becomes furniture.
@@ -1526,12 +1559,22 @@ button:disabled {
   white-space: nowrap;
 }
 
+// One line, always — weight, delegator cut and produced% used to wrap onto a
+// second whenever a pillar's numbers ran long, so the row's height changed
+// from one pillar to the next depending on nothing a person could predict.
+// A touch smaller is what buys that back.
 .pillar-stats {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-wrap: nowrap;
+  gap: 6px;
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: 10px;
+  overflow: hidden;
+
+  span {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
 
   .is-warning {
     color: var(--warning);
@@ -1951,6 +1994,22 @@ button:disabled {
   color: var(--text-dim);
 }
 
+// The raw block, collapsed under the human-readable summary rather than
+// beside it. What gets signed is still visible in full — one click away —
+// but it is no longer the first thing on the screen a person has to parse.
+.block-preview-details {
+  summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 12px;
+    user-select: none;
+  }
+
+  .block-preview {
+    margin-top: 8px;
+  }
+}
+
 //
 // Receive
 //
@@ -2144,7 +2203,7 @@ button:disabled {
 //
 // Toasts
 //
-.Toastify__toast-container {
+.Toastify__toast-container--bottom-center {
   width: 340px;
   padding: 0;
   left: 10px;
@@ -2165,11 +2224,53 @@ button:disabled {
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
 }
 
+// A success alert is the same bottom-center card as everything else — same
+// spacing above the edge of the popup — with one addition: a green bar across
+// its own top edge that fills over the two seconds it is up, instead of a
+// countdown tucked underneath, plus a small close button.
+.Toastify__toast.toast-successbar {
+  // The progress bar sits at the top edge of the card and IS the "fills
+  // green" indicator. Toastify's own bar drains — starts full and shrinks to
+  // nothing as time runs out — so the animation is played in reverse to fill
+  // instead.
+  .Toastify__progress-bar {
+    top: 0;
+    bottom: auto;
+    height: 3px;
+    opacity: 1;
+    background: var(--znn);
+  }
+
+  .Toastify__progress-bar--animated {
+    animation-direction: reverse;
+  }
+
+  .Toastify__close-button {
+    opacity: 0.6;
+    margin-left: 8px;
+  }
+
+  .Toastify__close-button:hover {
+    opacity: 1;
+  }
+
+  .Toastify__close-button > svg {
+    width: 10px;
+    height: 10px;
+  }
+}
+
 //
 // Reduced motion
 //
+// Toastify's progress bar is exempt: it is not decorative, its
+// `animation-duration` is the toast's actual on-screen time (`autoClose`
+// milliseconds, set inline) — react-toastify dismisses the toast when that
+// animation ends. Flattening it to 0.01ms here does not calm the motion, it
+// closes every toast almost the instant it opens, for anyone with reduced
+// motion turned on.
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *:not(.Toastify__progress-bar) {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;

@@ -4,7 +4,13 @@ import { Zenon } from 'znn-ts-sdk';
 
 import { SpinnerContext } from './spinner/spinnerContext';
 import { storeIsConnected, storeNodeUrl } from '../redux/connectionParametersSlice';
-import { getCurrentNodeUrl, getNodeList, setCurrentNodeUrl, setNodeList } from '../utils/storage';
+import {
+  defaultNodeUrl,
+  getCurrentNodeUrl,
+  getNodeList,
+  setCurrentNodeUrl,
+  setNodeList,
+} from '../utils/storage';
 import { notify } from '../utils/notify';
 import { announceNode } from '../wallet/announce';
 
@@ -25,9 +31,7 @@ const useNodeList = () => {
   const address = useSelector((state) => state.wallet.address);
 
   const [nodes, setNodes] = useState(() => getNodeList());
-  const [currentNode, setCurrentNode] = useState(
-    () => getCurrentNodeUrl() || Zenon.getSingleton().defaultServerUrl
-  );
+  const [currentNode, setCurrentNode] = useState(() => getCurrentNodeUrl() || defaultNodeUrl);
   const [isConnecting, setIsConnecting] = useState(false);
 
   const persist = (next) => {

@@ -1,11 +1,11 @@
 import { createSlice } from '@reduxjs/toolkit';
 import { Zenon } from 'znn-ts-sdk';
-import { getCurrentNodeUrl } from '../utils/storage';
+import { defaultNodeUrl, getCurrentNodeUrl } from '../utils/storage';
 
 const initialState = {
   // What the wallet is actually pointed at, preferring what was chosen last
-  // over the SDK's compiled-in default.
-  nodeUrl: getCurrentNodeUrl() || Zenon.getSingleton().defaultServerUrl,
+  // over the wallet's own compiled-in default.
+  nodeUrl: getCurrentNodeUrl() || defaultNodeUrl,
   // Whatever was last chosen under node settings, so a site that asks before
   // the wallet is unlocked is told the chain it would really be signed for.
   // The SDK falls back to mainnet when nothing has been stored yet.

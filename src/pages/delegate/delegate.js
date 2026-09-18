@@ -185,7 +185,7 @@ const Delegate = () => {
         {pillars.isEmpty && <p className="empty-note">No pillars found</p>}
 
         <div ref={pillars.sentinelRef} className="load-more-sentinel">
-          {pillars.isLoading && <span className="text-gray">Loading…</span>}
+          {pillars.showLoading && <span className="text-gray">Loading…</span>}
         </div>
       </div>
     </div>

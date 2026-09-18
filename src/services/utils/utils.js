@@ -16,6 +16,16 @@ const arrayShuffle = (array) => {
   return result;
 };
 
+// The SDK's own `KeyStoreManager.saveKeyStore` mangles the name it is given —
+// `name.replace(" ", "-")` swaps only the *first* space, not every one —
+// before using it as the storage key. A wallet name typed with a space then
+// saves under one key and gets looked up under another the moment the wallet
+// tries to unlock itself right after creating or importing it, which fails
+// with "Given keyFile does not exist" on a perfectly valid wallet. Doing the
+// full replacement ourselves before the name ever reaches the SDK leaves its
+// own replace with nothing to do, so save and lookup agree on the same key.
+const sanitizeWalletName = (name) => (name || '').trim().replace(/\s+/g, '-');
+
 const loadStorageWalletNames = () => {
   try {
     return Object.keys(new KeyStoreManager().listAllKeyStores() || {});
@@ -48,4 +58,10 @@ const removeStorageWallet = (walletName) => {
   }
 };
 
-export { arrayShuffle, loadStorageWalletNames, removeStorageWallet, walletStorageKey };
+export {
+  arrayShuffle,
+  loadStorageWalletNames,
+  removeStorageWallet,
+  sanitizeWalletName,
+  walletStorageKey,
+};

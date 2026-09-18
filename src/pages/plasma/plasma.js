@@ -1,7 +1,7 @@
 import React, { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
-import { Zenon } from 'znn-ts-sdk';
+import { Primitives, Zenon } from 'znn-ts-sdk';
 
 import AlertModal from '../../components/modals/alert-modal';
 import FuseItem from '../../components/fuse-item/fuse-item';
@@ -44,6 +44,10 @@ const Plasma = () => {
 
   const [addressObject, setAddressObject] = useState(null);
   const [amount, setAmount] = useState('');
+  // Who the plasma is for — fusing is a gift the contract allows to any
+  // address, not only your own. Defaults to this account so the common case
+  // (fusing for yourself) needs no typing.
+  const [recipient, setRecipient] = useState('');
   const [momentumHeight, setMomentumHeight] = useState(0);
   const [plasmaInfo, setPlasmaInfo] = useState(null);
   const [isPlasmaLoading, setIsPlasmaLoading] = useState(false);
@@ -59,6 +63,17 @@ const Plasma = () => {
     setValue,
     trigger,
   } = useForm({ mode: 'onChange' });
+
+  // Filled in once the account's own address is known, and only while the
+  // field is still at its untouched default — never overwriting an address
+  // someone has already typed in.
+  useEffect(() => {
+    if (address && !recipient) {
+      setRecipient(address);
+      setValue('recipientAddressField', address, { shouldValidate: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [address]);
 
   useEffect(() => {
     let cancelled = false;
@@ -162,6 +177,15 @@ const Plasma = () => {
     return true;
   };
 
+  const validateRecipient = (input) => {
+    try {
+      Primitives.Address.parse((input || '').trim());
+      return true;
+    } catch (err) {
+      return 'That is not a valid Zenon address';
+    }
+  };
+
   // Balances arrive a moment after the first render, so an amount typed while
   // the placeholder zero was in place has to be re-checked when the real one
   // shows up — otherwise the error stays on screen after it stops being true,
@@ -186,10 +210,15 @@ const Plasma = () => {
       notify.error(problem);
       return;
     }
+    if (validateRecipient(recipient) !== true) {
+      notify.error('That is not a valid Zenon address');
+      return;
+    }
 
     try {
       const parsed = parseAmount(amount, decimals);
-      const template = await Zenon.getSingleton().embedded.plasma.fuse(addressObject, parsed);
+      const beneficiary = Primitives.Address.parse(recipient.trim());
+      const template = await Zenon.getSingleton().embedded.plasma.fuse(beneficiary, parsed);
 
       sendInBackground(template, {
         successMessage: `Fused ${amount} QSR`,
@@ -203,6 +232,7 @@ const Plasma = () => {
       });
 
       setAmount('');
+      setRecipient(address);
       resetForm();
       navigate('/tabs/dashboard');
     } catch (err) {
@@ -225,14 +255,26 @@ const Plasma = () => {
     }
   };
 
-  const confirmFuse = () =>
+  const confirmFuse = () => {
+    const trimmedRecipient = recipient.trim();
+    const isSelf = trimmedRecipient === address;
+
     openModal(
       <AlertModal type="confirm" title="Fuse plasma" confirmLabel="Fuse" onSuccess={fuse}>
         <p>
-          Fuse <b>{amount} QSR</b> for plasma on this address?
+          Fuse <b>{amount} QSR</b> for plasma
+          {isSelf ? (
+            ' on this address?'
+          ) : (
+            <>
+              {' '}
+              for <b className="word-break-all">{trimmedRecipient}</b>?
+            </>
+          )}
         </p>
       </AlertModal>
     );
+  };
 
   const confirmCancel = (id) =>
     openModal(
@@ -260,7 +302,7 @@ const Plasma = () => {
         </div>
       </div>
 
-      <form id="fuseForm" onSubmit={handleSubmit(confirmFuse)}>
+      <form id="fuseForm" className="fields-only" onSubmit={handleSubmit(confirmFuse)}>
         <div className="custom-control">
           <div className="input-with-button w-100">
             <input
@@ -291,6 +333,44 @@ const Plasma = () => {
           </div>
           <div className={`input-error ${errors.toFuseQsrField ? '' : 'invisible'}`}>
             {errors.toFuseQsrField?.message || 'Amount is required'}
+          </div>
+        </div>
+
+        <div className="custom-control">
+          <div className="input-with-button w-100">
+            <input
+              {...register('recipientAddressField', {
+                required: true,
+                validate: validateRecipient,
+              })}
+              className={`w-100 custom-label pr-3 ${
+                errors.recipientAddressField ? 'custom-label-error' : ''
+              }`}
+              placeholder="Recipient address"
+              value={recipient}
+              onChange={(event) => {
+                setRecipient(event.target.value);
+                setValue('recipientAddressField', event.target.value, { shouldValidate: true });
+              }}
+              type="text"
+              spellCheck="false"
+              autoComplete="off"
+            />
+            {/* Fusing for yourself is the common case; this is the way back to
+                it after typing someone else's address. */}
+            <button
+              type="button"
+              className="input-chip-button"
+              onClick={() => {
+                setRecipient(address);
+                setValue('recipientAddressField', address, { shouldValidate: true });
+              }}
+            >
+              Me
+            </button>
+          </div>
+          <div className={`input-error ${errors.recipientAddressField ? '' : 'invisible'}`}>
+            {errors.recipientAddressField?.message || 'Address is required'}
           </div>
         </div>
       </form>
@@ -325,7 +405,7 @@ const Plasma = () => {
         )}
 
         <div ref={entries.sentinelRef} className="load-more-sentinel">
-          {entries.isLoading && <span className="text-gray">Loading…</span>}
+          {entries.showLoading && <span className="text-gray">Loading…</span>}
         </div>
       </div>
     </div>

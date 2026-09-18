@@ -1,5 +1,6 @@
 import { Zenon } from 'znn-ts-sdk';
 import { announceLock } from './announce';
+import { notify } from '../utils/notify';
 import session from './session';
 import vault from './vault';
 
@@ -15,6 +16,9 @@ const lockWallet = async () => {
   vault.lock();
   await session.clear();
   await announceLock();
+  // Nothing left over from the unlocked wallet should still be on screen once
+  // the password prompt is.
+  notify.dismissAll();
 
   try {
     Zenon.getSingleton().clearSocketConnection();

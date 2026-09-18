@@ -106,12 +106,19 @@ const useTransactions = (addressObject, address) => {
         amount: block.amount ?? 0,
         decimals: block.token?.decimals,
         tokenSymbol: block.token?.symbol || '',
-        address: block.toAddress?.toString() || '',
-        // Taken from this account's own block, not from the one it points at:
-        // whether a transaction is settled is a fact about the block in my
-        // chain, and for a receive the referenced send block was confirmed long
-        // before mine was.
-        hash: own.hash?.toString(),
+        // The other side of the transfer. For a receive, `block` is the
+        // origin send block (see `expand`), and on that block `toAddress` is
+        // this account, not the counterparty — the sender is `address`. A
+        // receive block's own `address`/`toAddress` pair (burn address as the
+        // destination) carries no such thing.
+        address: (type === 'received' ? block.address : block.toAddress)?.toString() || '',
+        // The block that actually carries this transfer, for the explorer
+        // link: the origin send block for a receive (again, what `block` is
+        // once expanded), the account's own block otherwise. Confirmation
+        // status is still read from `own` below — that's a fact about the
+        // block in my chain, and for a receive the referenced send block was
+        // confirmed long before mine was.
+        hash: block.hash,
         isUnconfirmed: !own.confirmationDetail,
         confirmations: own.confirmationDetail?.numConfirmations ?? 0,
       };

@@ -16,6 +16,8 @@ import {
 } from '../../services/utils/format';
 import { readableError } from '../../services/utils/errors';
 import { notify } from '../../services/utils/notify';
+import { embeddedContractName } from '../../services/utils/contracts';
+import { decodeCall, describeCall, contractDisplayName } from '../../services/utils/contractCalls';
 
 // What a site is asking for, and the choice about it.
 //
@@ -33,6 +35,48 @@ const hostOf = (origin) => {
   } catch (err) {
     return origin || 'Unknown site';
   }
+};
+
+// What a raw account block actually does, in words, for the "sign this block?"
+// screen — the one place a site can ask for literally anything.
+//
+// A block sent to an embedded contract is a call, not a transfer: "1 ZNN to
+// the HTLC contract" is really "authorize an HTLC swap, funded with 1 ZNN",
+// and describing it as a transfer buries the part that matters. A call this
+// build cannot decode has to look like a warning rather than like an ordinary
+// approval, because "unknown" is exactly the case where reading the raw data
+// below is not optional.
+const describeBlock = (json, tokenFor) => {
+  const contract = embeddedContractName(json?.toAddress);
+  const entry = tokenFor(json?.tokenStandard);
+  const amount = json?.amount;
+  const hasAmount = Boolean(amount) && amount !== '0';
+
+  if (!contract) {
+    return {
+      kind: 'transfer',
+      to: json?.toAddress,
+      amount,
+      hasAmount,
+      decimals: entry?.token?.decimals,
+      symbol: entry?.token?.symbol,
+      tokenStandard: json?.tokenStandard,
+    };
+  }
+
+  const method = decodeCall(contract, json?.data);
+  const contractName = contractDisplayName(contract);
+
+  return {
+    kind: method ? 'knownCall' : 'unknownCall',
+    contract: contractName,
+    label: method ? describeCall(contract, method) : null,
+    amount,
+    hasAmount,
+    decimals: entry?.token?.decimals,
+    symbol: entry?.token?.symbol,
+    tokenStandard: json?.tokenStandard,
+  };
 };
 
 const SiteHeader = ({ request }) => (
@@ -507,14 +551,94 @@ const SiteIntegrationLayout = () => {
         <>
           <div className="approval-body">
             <h2 className="approval-title">Sign this block?</h2>
-            <p className="approval-note">
-              This is a raw account block. It can call any contract — read it
-              before approving.
-            </p>
 
-            <pre className="block-preview">
-              {JSON.stringify(preview ?? request.params, null, 2)}
-            </pre>
+            {(() => {
+              const json = preview ?? request.params;
+              const info = describeBlock(json, tokenFor);
+              const amountRow = info.hasAmount && (
+                <>
+                  <dt>Amount</dt>
+                  <dd
+                    title={
+                      info.decimals !== undefined
+                        ? formatExact(info.amount, info.decimals)
+                        : undefined
+                    }
+                  >
+                    {info.decimals !== undefined ? (
+                      `${formatAmount(info.amount, info.decimals)} ${info.symbol}`
+                    ) : (
+                      <>
+                        {info.amount?.toString()}{' '}
+                        <span className="text-gray">base units</span>
+                      </>
+                    )}
+                  </dd>
+                </>
+              );
+
+              if (info.kind === 'unknownCall') {
+                return (
+                  <>
+                    <p className="approval-warning" role="alert">
+                      This calls the {info.contract} contract with a method
+                      this wallet does not recognize. Read the raw data below
+                      before approving.
+                    </p>
+                    <dl className="confirm-details">
+                      <dt>Contract</dt>
+                      <dd>{info.contract}</dd>
+                      {amountRow}
+                    </dl>
+                  </>
+                );
+              }
+
+              if (info.kind === 'knownCall') {
+                return (
+                  <>
+                    <p className="approval-note">
+                      This calls the embedded {info.contract} contract.
+                    </p>
+                    <dl className="confirm-details">
+                      <dt>Action</dt>
+                      <dd>{info.label}</dd>
+                      <dt>Contract</dt>
+                      <dd>{info.contract}</dd>
+                      {amountRow}
+                    </dl>
+                  </>
+                );
+              }
+
+              return (
+                <>
+                  <p className="approval-note">
+                    This is a plain transfer to an ordinary address. Not a
+                    contract call.
+                  </p>
+                  <dl className="confirm-details">
+                    {amountRow || (
+                      <>
+                        <dt>Amount</dt>
+                        <dd>Nothing</dd>
+                      </>
+                    )}
+                    <dt>To</dt>
+                    <dd className="word-break-all">{info.to}</dd>
+                    <dt>From</dt>
+                    <dd title={address}>{truncateAddress(address, 10, 6)}</dd>
+                  </dl>
+                </>
+              );
+            })()}
+
+            <details className="block-preview-details">
+              <summary>Raw transaction data</summary>
+              <pre className="block-preview">
+                {JSON.stringify(preview ?? request.params, null, 2)}
+              </pre>
+            </details>
 
             {shortfall && (
               <p className="approval-warning" role="alert">

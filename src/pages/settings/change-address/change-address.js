@@ -58,7 +58,9 @@ const ChangeAddress = () => {
     await session.touch({ selectedAddressIndex: index });
     await announceAddress(address);
 
-    notify.success('Address changed');
+    // Switching addresses repeatedly while this toast is still up reuses it
+    // rather than stacking one per click, the same as `notify.copied`.
+    notify.success('Address changed', { toastId: 'address-changed' });
   };
 
   const addAddress = () => {

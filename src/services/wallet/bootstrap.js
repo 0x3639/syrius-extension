@@ -5,7 +5,13 @@ import {
   storeNodeUrl,
 } from '../redux/connectionParametersSlice';
 import { walletUnlocked } from '../redux/walletSlice';
-import { getAddressInfo, getCurrentNodeUrl, setCurrentNodeUrl } from '../utils/storage';
+import {
+  defaultNodeUrl,
+  getAddressInfo,
+  getCurrentNodeUrl,
+  setCurrentNodeUrl,
+  setLastWalletName,
+} from '../utils/storage';
 import { announceUnlock } from './announce';
 import session from './session';
 import vault from './vault';
@@ -21,7 +27,7 @@ import vault from './vault';
 // the unlock; the header reports the connection separately.
 
 const connectToNode = async (dispatch) => {
-  const nodeUrl = getCurrentNodeUrl() || Zenon.getSingleton().defaultServerUrl;
+  const nodeUrl = getCurrentNodeUrl() || defaultNodeUrl;
   setCurrentNodeUrl(nodeUrl);
   dispatch(storeNodeUrl(nodeUrl));
 
@@ -45,6 +51,10 @@ const completeUnlock = async ({ walletName, password, entropy, dispatch }) => {
   } else {
     await vault.unlockWithPassword(walletName, password);
   }
+
+  // Recorded only once the password (or entropy) above has actually checked
+  // out — a wrong guess must never become the screen's next default.
+  setLastWalletName(walletName);
 
   const addressInfo = getAddressInfo(walletName);
   vault.setSelectedIndex(addressInfo.selectedAddressIndex);

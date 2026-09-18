@@ -8,7 +8,7 @@ import NavBack from '../../components/nav-back/nav-back';
 import OrderWords from '../../components/order-words/order-words';
 import ProgressSteps from '../../components/progress-steps/progress-steps';
 import fallbackValues from '../../services/utils/fallbackValues';
-import { arrayShuffle, loadStorageWalletNames } from '../../services/utils/utils';
+import { arrayShuffle, loadStorageWalletNames, sanitizeWalletName } from '../../services/utils/utils';
 import { copyToClipboard, notify } from '../../services/utils/notify';
 import { completeUnlock } from '../../services/wallet/bootstrap';
 
@@ -52,7 +52,7 @@ const GetStarted = () => {
     if (!name?.trim()) {
       return 'Give this wallet a name';
     }
-    if (loadStorageWalletNames().includes(name)) {
+    if (loadStorageWalletNames().includes(sanitizeWalletName(name))) {
       return 'You already have a wallet with that name';
     }
     return true;
@@ -85,14 +85,15 @@ const GetStarted = () => {
     setIsBusy(true);
 
     try {
+      const storageName = sanitizeWalletName(walletName);
       // Awaited, unlike before: nothing may claim the wallet exists until it
       // has actually been written.
-      await new KeyStoreManager().saveKeyStore(keyStore, password, walletName);
+      await new KeyStoreManager().saveKeyStore(keyStore, password, storageName);
 
       // Straight into the wallet with the password just chosen, rather than
       // sending somebody to a login screen they have every reason to think
       // they have already passed.
-      await completeUnlock({ walletName, password, dispatch });
+      await completeUnlock({ walletName: storageName, password, dispatch });
       notify.success('Wallet created');
       navigate('/tabs/dashboard', { replace: true });
     } catch (err) {

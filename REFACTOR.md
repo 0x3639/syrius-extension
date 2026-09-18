@@ -23,7 +23,7 @@ state is legible without re-reading every diff.
 | production build | 33 s |
 | time to first interaction | ~3 s splash, then Argon2id unlock |
 
-Known-bad from `../syrius-extension-security-audit.md`: MV3 `window.open` in the
+Known-bad from `../zenon-docs/security/syrius-extension-audit.md`: MV3 `window.open` in the
 service worker (already fixed in the working tree), an unauthenticated
 plaintext-password oracle in the background script, and a suspected
 blob-worker/CSP break in Plasma PoW.

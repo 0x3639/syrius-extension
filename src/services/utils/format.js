@@ -87,6 +87,17 @@ const parseAmount = (input, decimals) => {
   }
 };
 
+// A dollar amount, grouped like `formatAmount`. Small holdings are worth a
+// couple more decimal places — $0.03 and $0.0003 read very differently — but
+// past a dollar the extra precision is noise nobody asked for.
+const formatUsd = (amount) => {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) {
+    return null;
+  }
+  const decimals = Math.abs(amount) < 1 ? 4 : 2;
+  return `$${groupThousands(amount.toFixed(decimals))}`;
+};
+
 // Addresses are 40 characters and the popup is 360px wide.
 const truncateAddress = (address, lead = 6, tail = 4) => {
   const text = (address || '').toString();
@@ -118,6 +129,7 @@ export {
   defaultDecimals,
   formatAmount,
   formatExact,
+  formatUsd,
   isRounded,
   parseAmount,
   toBigNumber,

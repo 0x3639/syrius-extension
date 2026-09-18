@@ -7,6 +7,8 @@ import TransactionItem from '../../../components/transaction-item/transaction-it
 import Icon from '../../../components/icon/icon';
 import useAccount from '../../../services/hooks/useAccount';
 import useTransactions from '../../../services/hooks/useTransactions';
+import useDelayedFlag from '../../../services/hooks/useDelayedFlag';
+import usePriceFeed from '../../../services/hooks/usePriceFeed';
 import vault from '../../../services/wallet/vault';
 import {
   countPendingBlocks,
@@ -17,9 +19,10 @@ import {
 } from '../../../services/wallet/account';
 import { embeddedContractName } from '../../../services/utils/contracts';
 import { contractDisplayName } from '../../../services/utils/contractCalls';
-import { formatAmount, formatExact, truncateAddress } from '../../../services/utils/format';
-import { copyToClipboard, notify } from '../../../services/utils/notify';
+import { formatAmount, formatExact, formatUsd } from '../../../services/utils/format';
+import { notify } from '../../../services/utils/notify';
 import { getSettings, setSetting } from '../../../services/utils/storage';
+import { mainnetChainId } from '../../../services/utils/chainId';
 import {
   pendingStatus,
   clearPendingTransaction,
@@ -61,6 +64,10 @@ const Dashboard = () => {
   // Blocks this wallet has sent that are not in the account's chain yet. They
   // outlive the screen that started them, which is the whole point.
   const allOutgoing = useSelector((state) => state.pendingTransactions.items);
+  const { chainIdentifier, isConnected } = useSelector((state) => state.connectionParameters);
+  // A price is a fact about mainnet; nothing else has one to poll for.
+  const isMainnet = isConnected && chainIdentifier === mainnetChainId;
+  const prices = usePriceFeed(isMainnet);
 
   const [addressObject, setAddressObject] = useState(null);
   const [pendingCount, setPendingCount] = useState(0);
@@ -244,8 +251,43 @@ const Dashboard = () => {
   const znn = balanceMap[znnZts];
   const qsr = balanceMap[qsrZts];
 
-  const renderBalance = (entry) =>
-    hideBalances ? '••••' : formatAmount(entry?.balance, entry?.token?.decimals);
+  // For display only: whether to actually show a "Loading…" label at the
+  // bottom of the list. See `useDelayedFlag`.
+  const showLoading = useDelayedFlag(transactions.isLoading || isLoading);
+
+  // A plain JS number for multiplying against a USD price. Losing precision
+  // past 2^53 units is not a concern here — this feeds a rounded dollar
+  // estimate, not another on-chain amount.
+  const tokenAmountNumber = (entry) => {
+    const value = parseFloat(formatExact(entry?.balance, entry?.token?.decimals));
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  // Four figures or more already reads fine without decimals, and dropping
+  // them is what keeps a balance this size from overflowing its half of the
+  // row into an ellipsis. Read straight off `formatExact`'s string rather
+  // than round-tripping through a float, so a whole-number count this large
+  // is never at the mercy of floating-point precision.
+  const renderBalance = (entry) => {
+    if (hideBalances) {
+      return '••••';
+    }
+    const wholeDigits = formatExact(entry?.balance, entry?.token?.decimals)
+      .split('.')[0]
+      .replace('-', '').length;
+    return formatAmount(entry?.balance, entry?.token?.decimals, {
+      maxDecimals: wholeDigits >= 4 ? 0 : 4,
+    });
+  };
+
+  const znnUsdValue = prices.znn !== null ? tokenAmountNumber(znn) * prices.znn : null;
+  const qsrUsdValue = prices.qsr !== null ? tokenAmountNumber(qsr) * prices.qsr : null;
+  // Whichever side of the pair has a live price still contributes, rather
+  // than the total going blank because only one token's price came back.
+  const totalUsdValue =
+    znnUsdValue !== null || qsrUsdValue !== null ? (znnUsdValue || 0) + (qsrUsdValue || 0) : null;
+
+  const renderUsd = (value) => (hideBalances ? '••••' : formatUsd(value));
 
   return (
     <div className="page">
@@ -260,7 +302,12 @@ const Dashboard = () => {
             <span className="balance-amount" title={formatExact(znn?.balance, znn?.token?.decimals)}>
               {renderBalance(znn)}
             </span>
-            <span className="balance-symbol znn">ZNN</span>
+            <span className="balance-meta">
+              <span className="balance-symbol znn">ZNN</span>
+              {znnUsdValue !== null && (
+                <span className="balance-usd">{renderUsd(znnUsdValue)}</span>
+              )}
+            </span>
           </button>
 
           <button
@@ -272,19 +319,23 @@ const Dashboard = () => {
             <span className="balance-amount" title={formatExact(qsr?.balance, qsr?.token?.decimals)}>
               {renderBalance(qsr)}
             </span>
-            <span className="balance-symbol qsr">QSR</span>
+            <span className="balance-meta">
+              <span className="balance-symbol qsr">QSR</span>
+              {qsrUsdValue !== null && (
+                <span className="balance-usd">{renderUsd(qsrUsdValue)}</span>
+              )}
+            </span>
           </button>
         </div>
 
-        <button
-          type="button"
-          className="balance-address"
-          onClick={() => copyToClipboard(address, 'Address copied')}
-          title={address}
-        >
-          {truncateAddress(address, 8, 6)}
-          <img alt="" src={require('./../../../assets/copy-icon.png')} width="10" />
-        </button>
+        {/* The address lives in the header's account pill too; down here it
+            only ever duplicated it. Replaced with what the header cannot
+            show: what the two balances above are worth together. */}
+        {totalUsdValue !== null && (
+          <div className="balance-total" title="ZNN + QSR, at the prices above">
+            {renderUsd(totalUsdValue)} total
+          </div>
+        )}
       </section>
 
       <div className="action-row">
@@ -388,7 +439,7 @@ const Dashboard = () => {
         )}
 
         <div ref={loadMoreRef} className="load-more-sentinel">
-          {(transactions.isLoading || isLoading) && <span className="text-gray">Loading…</span>}
+          {showLoading && <span className="text-gray">Loading…</span>}
         </div>
       </section>
     </div>

@@ -220,7 +220,7 @@ const Stake = () => {
         </button>
       </div>
 
-      <form id="stakeForm" onSubmit={handleSubmit(confirmStake)}>
+      <form id="stakeForm" className="fields-only" onSubmit={handleSubmit(confirmStake)}>
         <div className="custom-control">
           <div className="input-with-button w-100">
             <input
@@ -297,7 +297,7 @@ const Stake = () => {
         {entries.isEmpty && <p className="empty-note">Nothing staked yet</p>}
 
         <div ref={entries.sentinelRef} className="load-more-sentinel">
-          {entries.isLoading && <span className="text-gray">Loading…</span>}
+          {entries.showLoading && <span className="text-gray">Loading…</span>}
         </div>
       </div>
     </div>

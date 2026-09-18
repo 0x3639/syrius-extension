@@ -21,8 +21,10 @@
 # secrets
 secrets.*.js
 
-# dev harness: throwaway chrome profile, its wallet and its screenshots
+# dev harness: throwaway chrome profile, its wallet and its screenshots —
+# one directory per instance, so a two-sided test has two of them
 /.dev-harness
+/.dev-harness-*
 
 # the SDK's StorageController writes this when it is required outside a browser,
 # which the checks in utils/ do

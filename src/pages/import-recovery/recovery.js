@@ -7,7 +7,7 @@ import { KeyStore, KeyStoreManager } from 'znn-ts-sdk';
 import NavBack from '../../components/nav-back/nav-back';
 import ProgressSteps from '../../components/progress-steps/progress-steps';
 import fallbackValues from '../../services/utils/fallbackValues';
-import { loadStorageWalletNames } from '../../services/utils/utils';
+import { loadStorageWalletNames, sanitizeWalletName } from '../../services/utils/utils';
 import { notify } from '../../services/utils/notify';
 import { completeUnlock } from '../../services/wallet/bootstrap';
 
@@ -73,7 +73,7 @@ const Recovery = () => {
     if (!name?.trim()) {
       return 'Give this wallet a name';
     }
-    if (loadStorageWalletNames().includes(name)) {
+    if (loadStorageWalletNames().includes(sanitizeWalletName(name))) {
       return 'You already have a wallet with that name';
     }
     return true;
@@ -84,10 +84,11 @@ const Recovery = () => {
 
     try {
       const store = new KeyStore().fromMnemonic(normalise(phrase));
+      const storageName = sanitizeWalletName(walletName);
       // Awaited, unlike before.
-      await new KeyStoreManager().saveKeyStore(store, password, walletName);
+      await new KeyStoreManager().saveKeyStore(store, password, storageName);
 
-      await completeUnlock({ walletName, password, dispatch });
+      await completeUnlock({ walletName: storageName, password, dispatch });
       notify.success('Wallet imported');
       navigate('/tabs/dashboard', { replace: true });
     } catch (err) {

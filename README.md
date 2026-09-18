@@ -7,7 +7,7 @@ through `znn-ts-sdk`) and never leave the machine. The extension talks to a
 Zenon node of your choosing over a websocket, and to web pages through an
 injected provider that cannot do anything without being asked first.
 
-Current version: **0.3.2**, Manifest V3. What changed against the published
+Current version: **0.3.3**, Manifest V3. What changed against the published
 `MichZNN/syrius-extension` build is in [CHANGELOG.md](CHANGELOG.md); the working
 notes behind it are in [REFACTOR.md](REFACTOR.md).
 
@@ -114,6 +114,47 @@ end to end — connect prompt, approval, reconnecting without a second prompt, a
 a message signed through the approval window — against the Chrome the harness is
 already running.
 
+The same Chrome can drive any dApp and answer the wallet for it, one command at
+a time, which is how a site's wallet integration gets tested against the real
+extension rather than a stub:
+
+```bash
+node utils/dev-harness.js open http://127.0.0.1:4175/        # the page under test
+node utils/dev-harness.js page click "text=Prove Zenon address"
+node utils/dev-harness.js approvals                          # what is queued, oldest first
+node utils/dev-harness.js approve --expect connect
+node utils/dev-harness.js approve --expect signMessage
+node utils/dev-harness.js page fill "#some-input" "a value"
+node utils/dev-harness.js page shot --full --out page.png
+node utils/dev-harness.js reject                             # answer the next one with no
+```
+
+`page` acts on the tab `open` last created, or on `--url <part of its
+address>`. `approve` prints the approval screen verbatim before it presses
+anything, waits for the wallet to let go of the request — a block may mine
+plasma first — and fails if the wallet shows an error. It refuses to press
+anything unless the wallet's node is on this machine and its chain is not
+mainnet's, and `--expect <type>` makes it refuse a request of any other kind.
+`page reload` is worth knowing beside `page goto`: on a single-page app an
+address that differs only in its hash moves the router without reloading, so
+anything the page read at startup stays on screen after it has changed.
+
+Two sides of a trade need two wallets that cannot see each other, which means
+two browsers. `--instance <name>` gives each its own profile, wallet, port and
+screenshots, and `--address-index` at `start` is what makes the second one
+somebody else:
+
+```bash
+node utils/dev-harness.js start --instance a --address-index 1
+node utils/dev-harness.js start --instance b --address-index 2
+node utils/dev-harness.js open --instance b http://127.0.0.1:4175/
+node utils/dev-harness.js approve --instance b --expect signAndSendBlock
+node utils/dev-harness.js stop --instance b
+```
+
+Within one wallet, the Change address screen at `tabs/change-address` switches
+account without a second instance.
+
 The auto-unlock only exists in builds made by the harness: it needs
 `SYRIUS_DEV_WALLET=true`, which nothing else sets, it refuses to run in a
 production build, and even then it does nothing until the harness leaves a
@@ -130,7 +171,7 @@ merging a release. To use the tag-triggered path manually instead of the
 automatic `main` release:
 
 ```bash
-git tag v0.3.2 && git push origin v0.3.2
+git tag v0.3.3 && git push origin v0.3.3
 ```
 
 The normal `main` workflow creates the tag itself. The workflow does not

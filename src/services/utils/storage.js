@@ -16,6 +16,7 @@ const keys = {
   addressInfo: 'addressInfo',
   labels: 'syrius.addressLabels',
   settings: 'syrius.settings',
+  lastWalletName: 'syrius.lastWalletName',
 };
 
 const readJson = (key, fallback) => {
@@ -47,6 +48,7 @@ const writeJson = (key, value) => {
 //
 const defaultNodes = [
   'wss://my.hc1node.com:35998',
+  'wss://node.zenonhub.io:35998',
   'wss://secure.deeznnodez.com:35998',
   'ws://127.0.0.1:35998',
 ];
@@ -58,9 +60,24 @@ const getNodeList = () => {
 
 const setNodeList = (nodes) => writeJson(keys.nodeList, nodes);
 
+// The node the wallet connects to before anyone has ever picked one.
+const defaultNodeUrl = defaultNodes[0];
+
 const getCurrentNodeUrl = () => localStorage.getItem(keys.currentNodeUrl) || null;
 
 const setCurrentNodeUrl = (url) => localStorage.setItem(keys.currentNodeUrl, url);
+
+// Which wallet unlocked last, so the unlock screen can default to it instead
+// of an empty dropdown. Unlike `services/wallet/session.js`, this survives the
+// session expiring or the browser closing — it is exactly what is still
+// around on the screen that asks for a password again.
+const getLastWalletName = () => localStorage.getItem(keys.lastWalletName) || null;
+
+const setLastWalletName = (walletName) => {
+  if (walletName) {
+    localStorage.setItem(keys.lastWalletName, walletName);
+  }
+};
 
 //
 // Per-wallet address bookkeeping: which index is selected and how many have
@@ -157,6 +174,7 @@ const setSetting = (key, value) => {
 export {
   keys,
   defaultNodes,
+  defaultNodeUrl,
   defaultSettings,
   defaultSelectedAddressIndex,
   defaultMaxAddressIndex,
@@ -164,6 +182,8 @@ export {
   setNodeList,
   getCurrentNodeUrl,
   setCurrentNodeUrl,
+  getLastWalletName,
+  setLastWalletName,
   getAddressInfo,
   setAddressInfo,
   forgetAddressInfo,

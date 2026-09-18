@@ -8,6 +8,7 @@ import { useForm } from 'react-hook-form';
 
 import { completeUnlock } from '../../../services/wallet/bootstrap';
 import { loadStorageWalletNames } from '../../../services/utils/utils';
+import { getLastWalletName } from '../../../services/utils/storage';
 import { readDevWalletConfig } from '../../../services/utils/devWallet';
 import { readableError } from '../../../services/utils/errors';
 import { notify } from '../../../services/utils/notify';
@@ -90,10 +91,14 @@ const DashboardPassword = () => {
     }
 
     // One wallet is the overwhelmingly common case; preselecting it turns the
-    // screen into a single field.
-    if (wallets.length === 1) {
-      setSelectedWallet(wallets[0]);
-      setValue('selectedWalletField', wallets[0], { shouldValidate: true });
+    // screen into a single field. With more than one, default to whichever
+    // unlocked last rather than leaving the picker blank every time.
+    const preselected =
+      wallets.length === 1 ? wallets[0] : wallets.find((name) => name === getLastWalletName());
+
+    if (preselected) {
+      setSelectedWallet(preselected);
+      setValue('selectedWalletField', preselected, { shouldValidate: true });
     }
     passwordInput.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps

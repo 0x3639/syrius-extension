@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import useDelayedFlag from './useDelayedFlag';
+
 // Paging a list from an embedded-contract RPC.
 //
 // Four screens carried their own copy of this: a `useRef` observer, a
@@ -96,10 +98,15 @@ const usePagedList = (fetchPage, { pageSize = 10, enabled = true } = {}) => {
     return () => observer.disconnect();
   }, [enabled, loadMore]);
 
+  // For display only: whether to actually show a "Loading…" label. See
+  // `useDelayedFlag`.
+  const showLoading = useDelayedFlag(isLoading);
+
   return {
     items,
     meta,
     isLoading,
+    showLoading,
     hasMore,
     error,
     sentinelRef,

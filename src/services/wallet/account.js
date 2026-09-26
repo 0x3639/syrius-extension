@@ -1,5 +1,6 @@
 import { Enums, Primitives } from 'znn-ts-sdk';
-import fallbackValues from '../utils/fallbackValues';
+import { toDecimals } from '../utils/format';
+import { nativeTokens, normalizeTokenStandard, znnZts, qsrZts } from './tokenMetadata';
 
 // Reading an account, once, in a shape the screens can use.
 //
@@ -9,9 +10,6 @@ import fallbackValues from '../utils/fallbackValues';
 // around that by merging in a hard-coded pair of zero balances, in slightly
 // different ways, and then only ever showed those two — which is why the wallet
 // could hold a ZTS token and never mention it.
-
-const znnZts = 'zts1znnxxxxxxxxxxxxx9z4ulx';
-const qsrZts = 'zts1qsrxxxxxxxxxxxxxmrhjll';
 
 // ZNN and QSR lead, because they are the two the rest of the wallet is about.
 // After that the largest holdings first, then alphabetically so the order is
@@ -43,10 +41,37 @@ const sortBalances = (balances) =>
 // The two base tokens are always present, at zero if need be, so that the send
 // screen and the dashboard have something to render before the first response
 // and after an empty one.
-const withBaseTokens = (balanceInfoMap) => ({
-  ...fallbackValues.availableTokens,
-  ...(balanceInfoMap || {}),
-});
+const withBaseTokens = (balanceInfoMap) => {
+  const balances = {};
+  for (const [key, entry] of Object.entries(balanceInfoMap || {})) {
+    const zts = normalizeTokenStandard(key);
+    if (Object.prototype.hasOwnProperty.call(balances, zts)) {
+      throw new Error('The node returned duplicate token identities');
+    }
+    const native = nativeTokens[zts];
+    if (!native && normalizeTokenStandard(entry?.token?.tokenStandard) !== zts) {
+      throw new Error('The node returned conflicting token identities');
+    }
+    if (!native && entry.token.decimals != null &&
+        !['string', 'number'].includes(typeof entry.token.decimals)) {
+      throw new Error('The node returned invalid token decimals');
+    }
+    balances[zts] = {
+      balance: entry?.balance ?? 0,
+      // Copy descriptive custom metadata; none of it authorizes a transfer.
+      token: Object.freeze(native ? { ...native } : {
+        tokenStandard: zts,
+        symbol: typeof entry.token.symbol === 'string' ? entry.token.symbol : '',
+        name: typeof entry.token.name === 'string' ? entry.token.name : '',
+        decimals: toDecimals(entry.token.decimals),
+      }),
+    };
+  }
+  for (const [zts, token] of Object.entries(nativeTokens)) {
+    balances[zts] ??= { balance: 0, token };
+  }
+  return balances;
+};
 
 const fetchBalances = async (zenon, addressObject) => {
   const accountInfo = await zenon.ledger.getAccountInfoByAddress(addressObject);

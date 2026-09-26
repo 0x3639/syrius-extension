@@ -220,8 +220,8 @@ const SiteIntegrationLayout = () => {
   const approvalReady = isCurrentBlockApproval(approval);
   const preparedBlock = approval && (approvalReady || approvalInFlight.current) ? approval.block : null;
 
-  const finish = async (id, result, grantOrigin = false) => {
-    await sendInternal('approvals.resolve', { id, result, grantOrigin });
+  const finish = async (id, result, grantOrigin = false, identity = {}) => {
+    await sendInternal('approvals.resolve', { id, result, grantOrigin, ...identity });
     await loadNext();
   };
 
@@ -231,7 +231,7 @@ const SiteIntegrationLayout = () => {
     }
     activePreparation.current = null;
     setPreview(null);
-    await sendInternal('approvals.reject', { id: request.id });
+    await sendInternal('approvals.reject', { id: request.id, approvalId: request.approvalId });
     await loadNext();
   };
 
@@ -316,19 +316,28 @@ const SiteIntegrationLayout = () => {
     approvalInFlight.current = true;
     setIsBusy(true);
     const approvedRequest = request;
+    const identity = { approvalId: approvedRequest.approvalId, claimId: crypto.randomUUID() };
+    let claimed = false;
     try {
+      const { id: windowId } = await chrome.windows.getCurrent();
+      claimed = await sendInternal('approvals.claimBlock', {
+        id: approvedRequest.id, ...identity, windowId,
+      });
+      if (!claimed) throw new Error('This request was already answered or changed.');
       const signed = await sendPrepared(approval);
       await finish(approvedRequest.id, {
         hash: signed.hash?.toString(),
         block: signed.toJson?.() ?? null,
-      });
+      }, false, identity);
       notify.success('Block sent');
     } catch (err) {
       notify.error(err);
-      await sendInternal('approvals.reject', {
-        id: approvedRequest.id,
-        error: { code: -32603, message: readableError(err) },
-      });
+      if (claimed) {
+        await sendInternal('approvals.reject', {
+          id: approvedRequest.id, ...identity,
+          error: { code: -32603, message: readableError(err) },
+        });
+      }
       await loadNext();
     } finally {
       approvalInFlight.current = false;

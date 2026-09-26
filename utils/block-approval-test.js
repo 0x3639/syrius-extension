@@ -4,6 +4,7 @@ const path = require('node:path');
 const babel = require('@babel/core');
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
+global.chrome = { windows: { getCurrent: async () => ({ id: 1 }) } };
 global.window = { crypto: require('node:crypto').webcrypto, close() {} };
 const memory = new Map();
 global.localStorage = { getItem: key => memory.get(key) ?? null, setItem: (key, value) => memory.set(key, String(value)) };
@@ -18,6 +19,8 @@ const loadModules = (override) => {
     const mod = { exports: {} };
     const { code } = babel.transformFileSync(filename, { presets: [['@babel/preset-env', { targets: { node: 'current' } }], '@babel/preset-react'], babelrc: false, configFile: false });
     const resolve = name => {
+      // Match this package's actual webpack browser mapping.
+      if (name === 'buffer') return {};
       const value = override(name);
       if (value !== undefined) return value;
       if (name.startsWith('.')) {
@@ -95,7 +98,7 @@ const fixture = () => {
 };
 
 const elements = tree => !tree || typeof tree !== 'object' ? [] : Array.isArray(tree) ? tree.flatMap(elements) : [tree, ...elements(tree.props?.children)];
-const component = (f, first) => {
+const component = (f, first, broker) => {
   const states = [first, null, false, false];
   const refs = [];
   let cursor = 0;
@@ -116,7 +119,7 @@ const component = (f, first) => {
     if (name.endsWith('/hooks/useAccount')) return () => ({ balanceMap: { [zts]: { balance: BigNumber.from('1000000000000'), token: { decimals: 8, symbol: 'ZNN' } } } });
     if (name.endsWith('/hooks/useBlockSender')) return () => ({ sendPrepared: f.service.sendBlockApproval, isSending: false, isGeneratingPlasma: false });
     if (name.endsWith('/wallet/signMessage')) return {};
-    if (name.endsWith('/utils/messaging')) return { sendInternal: async type => type === 'approvals.next' ? { id: 'next', type: 'connect', params: {} } : null };
+    if (name.endsWith('/utils/messaging')) return { sendInternal: broker || (async type => type === 'approvals.next' ? { id: 'next', type: 'connect', params: {} } : true) };
     if (name.endsWith('/utils/notify')) return { notify: { success() {}, error: err => errors.push(err) } };
     return f.override(name);
   })('src/layouts/siteIntegrationLayout/siteIntegrationLayout.js').default;
@@ -127,7 +130,38 @@ const component = (f, first) => {
 };
 const action = tree => elements(tree).find(el => el.type === 'button' && el.props.onClick?.name === 'approveSignAndSend');
 const reject = tree => elements(tree).find(el => el.type === 'button' && el.props.children === 'Reject');
-const request = (id, amount) => ({ id, type: 'signAndSendBlock', origin: 'https://example.invalid', params: blockJson(amount) });
+const request = (id, amount) => ({ id, approvalId: `approval-${id}`, type: 'signAndSendBlock', origin: 'https://example.invalid', params: blockJson(amount) });
+
+
+// Chrome returns independent structured clones; a successful write is the
+// security boundary. The central lock fixture models the browser's origin-wide
+// Web Lock and coordinates independently loaded copies of requests.js.
+const queueFixture = () => {
+  const memory = {};
+  const tails = new Map();
+  const faults = { read: false, write: false };
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: {
+    request: (name, callback) => {
+      const operation = (tails.get(name) || Promise.resolve()).then(callback);
+      tails.set(name, operation.catch(() => {}));
+      return operation;
+    },
+  } });
+  chrome.storage = { session: {
+    get: async key => { if (faults.read) throw Error('storage read unavailable'); await tick(); return structuredClone({ [key]: memory[key] }); },
+    set: async values => { if (faults.write) throw Error('storage write unavailable'); await tick(); Object.assign(memory, structuredClone(values)); },
+    remove: async key => { delete memory[key]; },
+  } };
+  const fresh = () => loadModules(() => undefined)('src/sections/Background/requests.js').default;
+  const queue = fresh();
+  const broker = async (method, { id, ...params } = {}) => {
+    if (method === 'approvals.claimBlock') return queue.claimBlock(id, params);
+    if (method === 'approvals.resolve' || method === 'approvals.reject') return Boolean(await queue.remove(id, params));
+    if (method === 'approvals.next') return (await queue.oldest()) || { id: 'next', type: 'connect', params: {} };
+    throw Error('Unexpected internal method: ' + method);
+  };
+  return { queue, fresh, broker, faults };
+};
 
 (async () => {
   for (const initial of [undefined, null, { id: 'connect', type: 'connect', params: {} }]) {
@@ -230,12 +264,14 @@ const request = (id, amount) => ({ id, type: 'signAndSendBlock', origin: 'https:
     const page = component(f, request('A', '100000000'));
     assert.equal(action(page.render()).props.disabled, true);
     page.prepare(); await tick();
-    assert(renderToStaticMarkup(page.render()).includes('1 ZNN'));
+    const readyA = page.render();
+    assert(renderToStaticMarkup(readyA).includes('1 ZNN'));
     page.states[0] = request('B', '10000000000');
     const beforeEffect = page.render();
     assert(!renderToStaticMarkup(beforeEffect).includes('1 ZNN'));
     assert.equal(action(beforeEffect).props.disabled, true);
     await action(beforeEffect).props.onClick();
+    await action(readyA).props.onClick(); // callback retained from the old ready render
     assert.equal(f.state.signs, 0);
     const gate = f.hold('prepare');
     page.prepare(); await gate.started.promise;
@@ -285,5 +321,151 @@ const request = (id, amount) => ({ id, type: 'signAndSendBlock', origin: 'https:
     assert.equal(f.state.signs, 0);
     assert.equal(f.state.publishes.length, 0);
   }
-  console.log('block approval: exact prepared fields, real SDK send/receive/embedded controls, current-context guards, delayed lifecycle, single use, signer identity and actual JSX race regression passed');
+
+  {
+    const { queue, fresh, faults } = queueFixture();
+    await queue.add({ ...request('A', '100000000'), createdAt: 1 });
+    const original = await queue.get('A');
+    const claim = { approvalId: original.approvalId, claimId: 'owner', windowId: 11 };
+    const results = await Promise.all([
+      queue.claimBlock('A', claim),
+      fresh().claimBlock('A', { ...claim, claimId: 'competitor', windowId: 12 }),
+      fresh().attachWindow('A', 99),
+      fresh().add({ ...request('B', '200000000'), createdAt: 2 }),
+    ]);
+    assert.deepEqual(results.slice(0, 2), [true, false]);
+    assert.equal((await queue.get('A')).claimId, 'owner');
+    assert.equal((await queue.get('A')).windowId, 11);
+    assert.equal((await queue.oldest()).id, 'B');
+    assert.equal(await queue.remove('A'), null);
+    assert.equal(await queue.remove('A', { ...claim, claimId: 'competitor' }), null);
+    assert.equal(await queue.remove('A', { ...claim, approvalId: 'replacement' }), null);
+    assert.equal((await queue.remove('A', claim)).id, 'A');
+    assert.equal(await queue.claimBlock('A', claim), false);
+    await queue.add({ ...request('A', '100000000'), createdAt: 1 });
+    assert.notEqual((await queue.get('A')).approvalId, original.approvalId);
+    assert.equal(await queue.claimBlock('A', claim), false);
+    const current = await queue.get('A');
+    const nextClaim = { ...claim, approvalId: current.approvalId };
+    faults.write = true;
+    await assert.rejects(queue.claimBlock('A', nextClaim), /write unavailable/);
+    faults.write = false;
+    assert.equal((await queue.get('A')).claimId, undefined);
+    faults.read = true;
+    await assert.rejects(queue.claimBlock('A', nextClaim), /read unavailable/);
+    faults.read = false;
+    assert.equal(await queue.claimBlock('A', nextClaim), true);
+    assert.equal(await fresh().claimBlock('A', nextClaim), false); // restart/realm replay
+    await Promise.all(Array.from({ length: 20 }, (_, i) => fresh().add({ ...request(`parallel-${i}`, '1'), createdAt: i })));
+    assert.equal((await queue.list()).length, 22);
+  }
+
+  // The real worker listener retains its extension-sender gate. Window-close
+  // cleanup carries the captured record identity and cannot delete a request
+  // that was claimed by another live window while that cleanup was waiting.
+  {
+    const q = queueFixture();
+    const listeners = {}; const delivered = [];
+    const event = name => ({ addListener: fn => { listeners[name] = fn; } });
+    chrome.runtime = { id: 'fixture', getURL: p => 'chrome-extension://fixture/' + p, onMessage: event('message'), onInstalled: event('installed'), onStartup: event('startup') };
+    chrome.windows.onRemoved = event('windowRemoved');
+    chrome.tabs = { onRemoved: event('tabRemoved'), sendMessage: async (tabId, message, options) => { delivered.push({ tabId, message, options }); } };
+    chrome.alarms = { onAlarm: event('alarm'), create() {} };
+    const workerQueue = { ...q.queue };
+    loadModules(name => {
+      if (name === './requests') return workerQueue;
+      if (name === './frames') return { forTabs: async () => [], forgetTab() {} };
+      if (name === './permissions') return { list: async () => [] };
+    })('src/sections/Background/index.js');
+    await q.queue.add({ ...request('A', '1'), tabId: 10, frameId: 0, windowId: 101, createdAt: 1 });
+    const stored = await q.queue.get('A');
+    const params = { id: 'A', approvalId: stored.approvalId, claimId: 'claim', windowId: 202 };
+    const message = { channel: 'internal', method: 'approvals.claimBlock', params };
+    assert.equal(listeners.message(message, { id: 'fixture', url: 'https://example.invalid', tab: { id: 10 } }, () => { throw Error('untrusted sender answered'); }), false);
+    assert.equal((await q.queue.get('A')).claimId, undefined);
+    const call = (method, params) => new Promise(resolve => {
+      assert.equal(listeners.message({ channel: 'internal', method, params }, { id: 'fixture', url: 'chrome-extension://fixture/popup.html' }, resolve), true);
+    });
+    const gate = { started: deferred(), release: deferred() };
+    workerQueue.list = async () => { const snapshot = await q.queue.list(); gate.started.resolve(); await gate.release.promise; return snapshot; };
+    const closingOldWindow = listeners.windowRemoved(101);
+    await gate.started.promise;
+    assert.deepEqual(await call('approvals.claimBlock', params), { result: true });
+    gate.release.resolve(); await closingOldWindow;
+    assert.equal((await q.queue.get('A')).windowId, 202);
+    assert.equal(delivered.length, 0);
+    assert.deepEqual(await call('approvals.reject', { ...params, claimId: 'loser' }), { result: false });
+    assert.deepEqual(await call('approvals.resolve', { ...params, result: { synthetic: true } }), { result: true });
+    assert.equal(delivered.length, 1);
+    assert.deepEqual(delivered[0].message.result, { synthetic: true });
+    workerQueue.list = q.queue.list;
+    for (const claimed of [false, true]) {
+      await q.queue.add({ ...request('close', '1'), tabId: 10, frameId: 0, windowId: 303, createdAt: 1 });
+      const entry = await q.queue.get('close');
+      if (claimed) assert.equal(await q.queue.claimBlock('close', { approvalId: entry.approvalId, claimId: 'closing-owner', windowId: 303 }), true);
+      await listeners.windowRemoved(303);
+      assert.equal(await q.queue.get('close'), null);
+      assert.equal(delivered.at(-1).message.error.code, 4001);
+    }
+    assert.equal(delivered.length, 3);
+  }
+
+  // Actual two-component/SDK replay schedule from Daybreak: the second popup
+  // finishes preparing against the successor frontier after the first has
+  // published and removed A. Its local preview is ready, but the worker claim
+  // rejects it before a second signature or publication is possible.
+  {
+    const q = queueFixture();
+    await q.queue.add({ ...request('A', '100000000'), createdAt: 1 });
+    const shared = await q.queue.get('A');
+    const one = fixture(); const two = fixture();
+    const first = component(one, structuredClone(shared), q.broker);
+    const second = component(two, structuredClone(shared), q.broker);
+    first.render(); first.prepare(); await tick();
+    const gate = two.hold('prepare');
+    second.render(); second.prepare(); await gate.started.promise;
+    await action(first.render()).props.onClick();
+    assert.equal(one.state.publishes.length, 1);
+    assert.equal(await q.queue.get('A'), null);
+    two.state.height = 5;
+    gate.release.resolve(); await tick();
+    assert.equal(second.states[1].approval.block.height, 6);
+    const ready = second.render();
+    assert.equal(action(ready).props.disabled, false);
+    await action(ready).props.onClick();
+    assert.equal(two.state.signs, 0);
+    assert.equal(two.state.publishes.length, 0);
+    assert(second.errors.some(error => /already answered or changed/.test(error.message)));
+  }
+  // Competing ready popups and a failed claim write both fail before signing;
+  // a losing popup cannot reject the winner's persisted claim.
+  for (const scenario of ['competing', 'storageFailure', 'replacement']) {
+    const q = queueFixture();
+    await q.queue.add({ ...request('A', '100000000'), createdAt: 1 });
+    const shared = await q.queue.get('A');
+    const one = fixture(); const two = fixture();
+    const first = component(one, structuredClone(shared), q.broker);
+    const second = component(two, structuredClone(shared), q.broker);
+    first.render(); first.prepare(); second.render(); second.prepare(); await tick();
+    if (scenario === 'storageFailure') q.faults.write = true;
+    if (scenario === 'replacement') await q.queue.add({ ...request('A', '100000000'), createdAt: 1 });
+    if (scenario === 'competing') {
+      const gate = one.hold('key');
+      const sending = action(first.render()).props.onClick();
+      await gate.started.promise;
+      await action(second.render()).props.onClick();
+      assert((await q.queue.get('A')).claimId);
+      gate.release.resolve(); await sending;
+      assert.equal(one.state.signs, 1);
+      assert.equal(one.state.publishes.length, 1);
+    } else {
+      await action(first.render()).props.onClick();
+      assert.equal(one.state.signs, 0);
+      assert.equal(one.state.publishes.length, 0);
+    }
+    assert.equal(two.state.signs, 0);
+    assert.equal(two.state.publishes.length, 0);
+  }
+
+  console.log('block approval: exact prepared fields, real SDK send/receive/embedded controls, current-context guards, delayed lifecycle, single use, signer identity, actual JSX races, shared claims and worker lifecycle passed');
 })().catch(err => { console.error(String(err)); console.error(err.stack?.split('\n').slice(0, 6).join('\n')); process.exitCode = 1; });

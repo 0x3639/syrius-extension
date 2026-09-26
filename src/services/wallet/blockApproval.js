@@ -1,4 +1,3 @@
-import { Buffer } from 'buffer';
 import { Primitives, Zenon, utils as sdkUtils } from 'znn-ts-sdk';
 import { getCurrentNodeUrl } from '../utils/storage';
 import vault from './vault';
@@ -15,6 +14,8 @@ const freeze = (value) => {
   }
   return value;
 };
+const bytesToBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const base64ToBytes = (text) => Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
 const changed = () => new Error('This approval is no longer current. Review a new request.');
 
 // Capture the local vault lifetime by its memoized derivation handle. Lock or
@@ -77,15 +78,15 @@ const sendBlockApproval = async (approval, onPow) => {
   assertCurrent();
   const [address, publicKey] = await Promise.all([keyPair.getAddress(), keyPair.getPublicKey()]);
   assertCurrent();
-  if (address.toString() !== block.address || Buffer.from(publicKey).toString('base64') !== block.publicKey) {
+  if (address.toString() !== block.address || bytesToBase64(publicKey) !== block.publicKey) {
     throw changed();
   }
   // The SDK's fromJson does not decode the base64 emitted by toJson for key
   // bytes. Preserve them explicitly when copying the reviewed preparation.
   const template = Primitives.AccountBlockTemplate.fromJson({
     ...block,
-    publicKey: Buffer.from(block.publicKey, 'base64'),
-    signature: Buffer.from([]),
+    publicKey: base64ToBytes(block.publicKey),
+    signature: new Uint8Array(),
   });
   const assertFields = () => {
     assertCurrent();

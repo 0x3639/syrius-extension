@@ -14,8 +14,8 @@ import vault from './vault';
 // for a wallet the person believed they had just shut.
 const lockWallet = async () => {
   vault.lock();
-  await session.clear();
-  await announceLock();
+  const generation = await session.clear();
+  await announceLock(generation);
   // Nothing left over from the unlocked wallet should still be on screen once
   // the password prompt is.
   notify.dismissAll();

@@ -11,6 +11,11 @@ import Splash from '../../components/splash/splash';
 
 import { completeUnlock } from '../../services/wallet/bootstrap';
 import session from '../../services/wallet/session';
+import vault from '../../services/wallet/vault';
+import { resetWalletState } from '../../services/redux/walletSlice';
+import { resetPendingTransactions } from '../../services/redux/pendingTransactionsSlice';
+import { invalidateAccountCache } from '../../services/hooks/useAccount';
+import { notify } from '../../services/utils/notify';
 import { loadStorageWalletNames } from '../../services/utils/utils';
 import { getCurrentNodeUrl } from '../../services/utils/storage';
 import { isDevWalletBuild, prepareDevWallet } from '../../services/utils/devWallet';
@@ -29,6 +34,18 @@ const MainLayout = () => {
 
   // Captured once, before any redirect of ours can overwrite it.
   const requestedRoute = useRef(location.pathname);
+
+  // Local expiry and another extension window's lock also clear visible secrets
+  // and copied UI state. This cleanup must never clear a newer shared lease.
+  useEffect(() => vault.onLock(() => {
+    invalidateAccountCache();
+    dispatch(resetPendingTransactions());
+    dispatch(resetWalletState());
+    notify.dismissAll();
+    navigate('/password', { replace: true, state: {
+      returnTo: requestedRoute.current === '/site-integration' ? '/site-integration' : null,
+    } });
+  }), [dispatch, navigate]);
 
   // A way in for the dev harness that does not mean clicking through the whole
   // wallet to reach the screen being worked on. `utils/dev-harness.js` also
@@ -97,7 +114,7 @@ const MainLayout = () => {
         try {
           await completeUnlock({
             walletName: unlock.walletName,
-            entropy: unlock.entropy,
+            sessionRecord: unlock,
             dispatch,
           });
           if (!cancelled) {
@@ -110,7 +127,9 @@ const MainLayout = () => {
         } catch (err) {
           // A session that cannot be turned back into a wallet is a session
           // worth forgetting rather than one worth reporting.
-          await session.clear();
+          vault.lock(unlock.id);
+          try { await session.clear(unlock.id); }
+          catch (cleanupError) { /* Still show the locked UI when storage is unavailable. */ }
         }
       }
 

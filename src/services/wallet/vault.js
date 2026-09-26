@@ -11,15 +11,16 @@ const listeners = new Set();
 let timer;
 const isCurrent = (scope) => Boolean(scope && state.keyStore &&
   scope.generation === state.generation && scope.id === state.lease?.id);
-const lock = (expectedId) => {
+const lock = (expectedId, error) => {
   if (expectedId !== undefined && state.lease?.id !== expectedId) return;
   const wasUnlocked = Boolean(state.keyStore);
+  const leaseId = state.lease?.id;
   state.generation += 1;
   state.walletName = null; state.keyStore = null; state.lease = null; state.selectedIndex = 0;
   state.rawKeys.clear(); state.rawSigningKeys.clear(); state.publicKeys.clear(); state.signingKeys.clear(); state.addresses.clear();
   clearTimeout(timer);
   if (wasUnlocked) listeners.forEach((listener) => {
-    try { listener(); } catch (error) { /* UI cleanup cannot block key revocation. */ }
+    try { listener({ leaseId, error }); } catch (error) { /* UI cleanup cannot block key revocation. */ }
   });
 };
 const onLock = (listener) => { listeners.add(listener); return () => listeners.delete(listener); };
@@ -53,7 +54,9 @@ const authorize = async (scope, operation) => {
     if (!isUnlocked()) throw session.ended();
     return result;
   } catch (error) {
-    if (error.code === 'WALLET_LOCKED' && isCurrent(scope)) lock();
+    if (['WALLET_LOCKED', 'WALLET_SESSION_UNAVAILABLE'].includes(error.code) && isCurrent(scope)) {
+      lock(scope.id, error);
+    }
     throw error;
   }
 };
@@ -160,7 +163,10 @@ const verifyPassword = async (password) => {
     const keyStore = await new KeyStoreManager().readKeyStore(password, walletName);
     await assertSession(scope);
     return Boolean(keyStore && keyStore.entropy === entropy);
-  } catch (error) { return false; }
+  } catch (error) {
+    if (error.code === 'WALLET_SESSION_UNAVAILABLE') throw error;
+    return false;
+  }
 };
 // The SDK manager combines slow encryption and an unconditional disk write.
 // Separate those phases so a completed lock can cancel a pending password change.
@@ -209,7 +215,9 @@ const touch = async (patch = {}, scope = capture()) => {
       assertLocal(scope); state.lease = record; schedule(); return true;
     });
   } catch (error) {
-    if (error.code === 'WALLET_LOCKED' && isCurrent(scope)) lock();
+    if (['WALLET_LOCKED', 'WALLET_SESSION_UNAVAILABLE'].includes(error.code) && isCurrent(scope)) {
+      lock(scope.id, error);
+    }
     throw error;
   }
 };

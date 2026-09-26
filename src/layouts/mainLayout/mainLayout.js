@@ -40,11 +40,19 @@ const MainLayout = () => {
 
   // Local expiry and another extension window's lock also clear visible secrets
   // and copied UI state. This cleanup must never clear a newer shared lease.
-  useEffect(() => vault.onLock(() => {
+  useEffect(() => vault.onLock(({ leaseId, error } = {}) => {
     invalidateAccountCache();
     dispatch(resetPendingTransactions());
     dispatch(resetWalletState());
     notify.dismissAll();
+    if (error?.code === 'WALLET_SESSION_UNAVAILABLE') {
+      // Local secrets have been purged, but shared revocation is unconfirmed.
+      // Retain its identity for the same conditional recovery used at startup.
+      pendingRevocation.current = leaseId;
+      setBootError(error.message);
+      setIsBooting(false);
+      return;
+    }
     navigate('/password', { replace: true, state: {
       returnTo: requestedRoute.current === '/site-integration' ? '/site-integration' : null,
     } });
@@ -77,7 +85,11 @@ const MainLayout = () => {
       if (!id) return;
       await session.clear(id);
       vault.lock(id);
-      if (pendingRevocation.current === id) pendingRevocation.current = null;
+      if (pendingRevocation.current === id) {
+        pendingRevocation.current = null;
+        setIsBooting(true);
+        setBootError(null);
+      }
     };
 
     const boot = async () => {
@@ -152,7 +164,7 @@ const MainLayout = () => {
 
     boot().catch((error) => {
       if (!cancelled) {
-        setBootError(error.code === 'WALLET_LOCK_FAILED' ? error.message :
+        setBootError(error?.code === 'WALLET_LOCK_FAILED' ? error.message :
           'Could not read or restore the wallet session. Other wallet windows may still be unlocked. Try again or close the browser.');
       }
     }).finally(() => {
@@ -174,7 +186,7 @@ const MainLayout = () => {
   if (bootError) {
     return (
       <div className="page" role="alert">
-        <h2>Could not finish wallet startup</h2>
+        <h2>Wallet session needs attention</h2>
         <p>{bootError}</p>
         <button type="button" className="button primary" onClick={() => {
           setIsBooting(true);

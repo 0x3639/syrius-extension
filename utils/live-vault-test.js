@@ -7,6 +7,7 @@ const root = path.join(__dirname, '..');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const locked = error => error.code === 'WALLET_LOCKED';
+const unavailable = error => error.code === 'WALLET_SESSION_UNAVAILABLE';
 
 const fixture = () => {
   const state = { now: 10000, storage: {}, listeners: [], events: true, failRead: false, failWrite: false, readFailures: 0, writeFailures: 0, gates: [], signs: [], timers: new Map(), nextTimer: 0, passwordReads: 0, persistent: {}, failPersistent: false };
@@ -265,12 +266,12 @@ const fixture = () => {
   for (const mode of ['read', 'write']) {
     const f = fixture(); const a = f.realm('a');
     f.state[mode === 'read' ? 'failRead' : 'failWrite'] = true;
-    await assert.rejects(a.vault.unlockWithPassword('A', 'ok'), locked);
+    await assert.rejects(a.vault.unlockWithPassword('A', 'ok'), unavailable);
     assert.equal(a.vault.isUnlocked(), false);
   }
   {
     const f = fixture(); const a = f.realm('a'); await a.vault.unlockWithPassword('A', 'ok'); const key = await a.vault.getSigningKeyPair();
-    f.state.failRead = true; await assert.rejects(key.sign(new Uint8Array([1])), locked); assert.equal(f.state.signs.length, 0);
+    f.state.failRead = true; await assert.rejects(key.sign(new Uint8Array([1])), unavailable); assert.equal(f.state.signs.length, 0);
   }
   // Explicit lock commits shared revocation before presenting local locked UI.
   // A failed attempt is visible and retryable; a transient fault is retried once.
@@ -521,6 +522,38 @@ const fixture = () => {
     }
     cancel(); unsubscribe();
   }
+
+  // Availability is not proof of revocation. Purge the affected document's
+  // keys, report the distinct status to its UI, and require a conditional
+  // recovery before claiming a global lock. No signature is produced by a
+  // faulting operation; the other document is tested after recovery only.
+  for (const operation of ['sign', 'public-key', 'touch-read', 'touch-write', 'verify']) {
+    const f = fixture(); const a = f.realm('affected'); const b = f.realm('other');
+    await a.vault.unlockWithPassword('A', 'ok'); await b.vault.restore(await b.session.load()); await f.flush();
+    const id = a.vault.capture().id; const key = await a.vault.getSigningKeyPair();
+    const other = await b.vault.getSigningKeyPair(); const events = []; a.vault.onLock(event => events.push(event));
+    f.state.events = false;
+    if (operation === 'touch-write') f.state.failWrite = true;
+    else f.state.failRead = true;
+    const action = operation === 'sign' ? () => key.sign(new Uint8Array([1])) :
+      operation === 'public-key' ? () => key.getPublicKey() :
+      operation === 'verify' ? () => a.vault.verifyPassword('ok') : () => a.vault.touch();
+    await assert.rejects(action(), unavailable);
+    assert.equal(a.vault.isUnlocked(), false); assert.equal(f.state.signs.length, 0);
+    assert.equal(events.length, 1); assert.equal(events[0].leaseId, id); assert(unavailable(events[0].error));
+    assert.equal(f.state.storage[a.session.sessionKey].id, id);
+    f.state.failRead = f.state.failWrite = false;
+    await a.session.clear(events[0].leaseId);
+    await assert.rejects(other.sign(new Uint8Array([2])), locked);
+    assert.equal(f.state.signs.length, 0);
+  }
+  {
+    const f = fixture(); let toasts = 0;
+    const a = f.realm('availability-notify', id => id === 'react-toastify' ? { toast: () => toasts++ } : undefined);
+    a.load('src/services/utils/notify.js').notify.error(a.lease.unavailable());
+    assert.equal(toasts, 1);
+  }
+
 
   // Installed SDK controls: real derivation, public address/key, Ed25519
   // signing/verification, and its complete block pipeline with an inert ledger.

@@ -3,9 +3,12 @@ const sessionKey = 'znn.unlock';
 const publicStateKey = 'znn.publicState';
 const lockName = 'znn.walletSession';
 const ended = () => Object.assign(new Error('The wallet session ended. Unlock it again.'), { code: 'WALLET_LOCKED' });
+const unavailable = () => Object.assign(new Error('Could not confirm the wallet session. Other wallet windows may still be unlocked. Try again or close the browser.'), {
+  code: 'WALLET_SESSION_UNAVAILABLE',
+});
 const storage = async (method, value) => {
   try { return await chrome.storage.session[method](value); }
-  catch (error) { throw ended(); }
+  catch (error) { throw unavailable(); }
 };
 const transaction = (operation) => navigator.locks.request(lockName, async () =>
   operation(await storage('get', [sessionKey, publicStateKey])));
@@ -104,5 +107,5 @@ const expire = () => transaction(async (stored) => {
   return live(record) ? null : revoke();
 });
 
-const sessionLease = { sessionKey, publicStateKey, ended, begin, create, use, renew, load, clear, publish, getPublicState, isLockedGeneration, expire };
+const sessionLease = { sessionKey, publicStateKey, ended, unavailable, begin, create, use, renew, load, clear, publish, getPublicState, isLockedGeneration, expire };
 export default sessionLease;

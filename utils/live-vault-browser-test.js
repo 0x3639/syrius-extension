@@ -198,6 +198,50 @@ let socket, cdp;
     }
     await cdp('Target.closeTarget', {targetId: startup.targetId});
   }
-  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, actualStartupErrorAndRetryUI: true, replacementLeasePreserved: true, profile: dir }));
+  // The same availability failure after startup uses an honest error view;
+  // it cannot expose ordinary locked UI without a committed shared revoke.
+  for (const mode of ['sign-read', 'public-read', 'touch-write', 'verify-read', 'storage-event', 'replacement']) {
+    await evaluate(b, "fixture.settings.autoLockMinutes = 15");
+    const originalId = await evaluate(b, "(async () => { const scope = await vault.unlockWithPassword('synthetic-boot','ok'); globalThis.runtimeSigner = await vault.getSigningKeyPair(); return scope.id; })()");
+    const affected = await openPage();
+    await evaluate(affected, "fixture.pathname = '/tabs/settings/export-mnemonic', mountStartup()");
+    await until(affected, "Boolean(document.getElementById('wallet-routes'))");
+    await evaluate(affected, "globalThis.runtimeKey = await vault.getSigningKeyPair()");
+    if (mode === 'storage-event') {
+      await evaluate(affected, 'fixture.failRead = true');
+      await evaluate(b, 'vault.touch()');
+    } else {
+      const call = mode === 'touch-write' ? 'vault.touch()' : mode === 'verify-read' ? "vault.verifyPassword('ok')" : mode === 'public-read' ? 'runtimeKey.getPublicKey()' : 'runtimeKey.sign(new Uint8Array([1]))';
+      const code = await evaluate(affected, `(async () => { fixture.${mode === 'touch-write' ? 'failWrite' : 'failRead'} = true; try { await ${call}; return null; } catch(error) { return error.code; } })()`);
+      assert.equal(code, 'WALLET_SESSION_UNAVAILABLE');
+    }
+    await until(affected, "Boolean(document.querySelector('[role=alert]'))");
+    assert.equal(await evaluate(affected, "Boolean(document.getElementById('wallet-routes'))"), false);
+    assert.match(await evaluate(affected, 'document.body.textContent'), /Other wallet windows may still be unlocked/);
+    assert.equal(await evaluate(affected, 'fixture.signs'), 0);
+    assert.equal(await evaluate(affected, 'vault.isUnlocked()'), false);
+    assert.equal(await evaluate(b, "(await chrome.storage.session.get('znn.unlock'))['znn.unlock'].id"), originalId);
+    if (mode === 'verify-read') {
+      await evaluate(affected, "document.querySelector('button').click()");
+      await until(affected, "Boolean(document.querySelector('[role=alert]'))");
+      assert.equal(await evaluate(affected, "Boolean(document.getElementById('wallet-routes'))"), false);
+      assert.match(await evaluate(affected, 'document.body.textContent'), /Could not lock all wallet windows/);
+      assert.equal(await evaluate(b, "(await chrome.storage.session.get('znn.unlock'))['znn.unlock'].id"), originalId);
+    }
+    let newer;
+    if (mode === 'replacement') newer = await evaluate(b, "(await vault.unlockWithPassword('synthetic-replacement','ok')).id");
+    await evaluate(affected, "fixture.failRead = fixture.failWrite = false, document.querySelector('button').click()");
+    await until(affected, "Boolean(document.getElementById('wallet-routes'))");
+    if (newer) {
+      assert.equal(await evaluate(affected, 'vault.capture().id'), newer);
+      assert.equal(await evaluate(b, 'vault.getAddress()'), 'synthetic-replacement:0');
+    } else {
+      assert.equal(await evaluate(affected, 'fixture.pathname'), '/password');
+      assert.equal(await evaluate(b, 'denied(() => runtimeSigner.sign(new Uint8Array([2])))'), true);
+    }
+    await cdp('Target.closeTarget', { targetId: affected.targetId });
+  }
+
+  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, actualStartupErrorAndRetryUI: true, runtimeAvailabilityErrorAndRetryUI: true, replacementLeasePreserved: true, profile: dir }));
   await cdp('Browser.close'); socket.close();
 })().catch(async error => { console.error(error.stack || String(error)); if (cdp) await cdp('Browser.close').catch(() => {}); socket?.close(); browser.kill(); process.exitCode = 1; });

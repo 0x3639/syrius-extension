@@ -9,7 +9,7 @@ const deferred = () => { let resolve, reject; const promise = new Promise((yes, 
 const locked = error => error.code === 'WALLET_LOCKED';
 
 const fixture = () => {
-  const state = { now: 10000, storage: {}, listeners: [], events: true, failRead: false, failWrite: false, gates: [], signs: [], timers: new Map(), nextTimer: 0, passwordReads: 0, persistent: {}, failPersistent: false };
+  const state = { now: 10000, storage: {}, listeners: [], events: true, failRead: false, failWrite: false, readFailures: 0, writeFailures: 0, gates: [], signs: [], timers: new Map(), nextTimer: 0, passwordReads: 0, persistent: {}, failPersistent: false };
   const tails = new Map();
   const navigator = { locks: { request: (name, operation) => {
     const result = (tails.get(name) || Promise.resolve()).then(operation);
@@ -60,9 +60,9 @@ const fixture = () => {
     }, Primitives: { Address: { parse: address } }, Zenon: { getSingleton: () => zenon, getChainIdentifier: () => 69 } };
     const chrome = { storage: {
       session: {
-        get: async keys => { if (state.failRead) throw Error('read failed'); const names = Array.isArray(keys) ? keys : [keys]; const values = Object.fromEntries(names.map(key => [key, state.storage[key]])); const copy = structuredClone(values); await pause('read', name); await tick(); return copy; },
+        get: async keys => { if (state.failRead || state.readFailures > 0) { state.readFailures--; throw Error('read failed'); } const names = Array.isArray(keys) ? keys : [keys]; const values = Object.fromEntries(names.map(key => [key, state.storage[key]])); const copy = structuredClone(values); await pause('read', name); await tick(); return copy; },
         set: async values => {
-          if (state.failWrite) throw Error('write failed'); await pause('write', name); const changes = {};
+          if (state.failWrite || state.writeFailures > 0) { state.writeFailures--; throw Error('write failed'); } await pause('write', name); const changes = {};
           for (const [key, value] of Object.entries(values)) { changes[key] = { oldValue: structuredClone(state.storage[key]), newValue: structuredClone(value) }; state.storage[key] = structuredClone(value); }
           if (state.events) queueMicrotask(() => state.listeners.forEach(listener => listener(structuredClone(changes), 'session')));
           await tick();
@@ -271,6 +271,89 @@ const fixture = () => {
   {
     const f = fixture(); const a = f.realm('a'); await a.vault.unlockWithPassword('A', 'ok'); const key = await a.vault.getSigningKeyPair();
     f.state.failRead = true; await assert.rejects(key.sign(new Uint8Array([1])), locked); assert.equal(f.state.signs.length, 0);
+  }
+  // Explicit lock commits shared revocation before presenting local locked UI.
+  // A failed attempt is visible and retryable; a transient fault is retried once.
+  for (const phase of ['read', 'write']) for (const transient of [false, true]) {
+    const f = fixture(); const a = f.realm('locker'); const b = f.realm('approval');
+    await a.vault.unlockWithPassword('A', 'ok'); await b.vault.restore(await b.session.load());
+    const signer = await b.vault.getSigningKeyPair(); await f.flush();
+    let localLocks = 0; a.vault.onLock(() => localLocks++);
+    const lockWallet = a.load('src/services/wallet/lock.js').default;
+    const failureKey = phase === 'read' ? 'failRead' : 'failWrite';
+    if (transient) f.state[phase === 'read' ? 'readFailures' : 'writeFailures'] = 1;
+    else f.state[failureKey] = true;
+    if (!transient) {
+      await assert.rejects(lockWallet(), error => error.code === 'WALLET_LOCK_FAILED' && /Try Lock again/.test(error.message));
+      assert.equal(localLocks, 0); assert.equal(a.vault.isUnlocked(), true);
+      assert.equal(b.vault.isUnlocked(), true); assert.equal(a.messages.length, 0);
+      f.state[failureKey] = false;
+    }
+    await lockWallet(); await f.flush();
+    assert.equal(localLocks, 1); assert.equal(a.vault.isUnlocked(), false); assert.equal(b.vault.isUnlocked(), false);
+    assert.equal(f.state.storage[a.session.sessionKey].entropy, undefined);
+    await assert.rejects(signer.sign(new Uint8Array([9])), locked);
+    assert.equal(f.state.signs.length, 0);
+  }
+  {
+    const f = fixture(); const a = f.realm('locker'); await a.vault.unlockWithPassword('A', 'ok'); await f.flush();
+    let lockedUI = false; a.vault.onLock(() => { lockedUI = true; });
+    const gate = f.hold('write', 'locker'); const pending = a.load('src/services/wallet/lock.js').default();
+    await gate.started.promise; assert.equal(lockedUI, false); assert.equal(a.vault.isUnlocked(), true);
+    gate.release.resolve(); await pending; assert.equal(lockedUI, true);
+  }
+  {
+    const notification = deferred(); const f = fixture(); let announced = false;
+    const a = f.realm('notification', id => id.endsWith('/utils/messaging') ? {
+      sendInternalQuietly: () => { announced = true; return notification.promise; },
+    } : undefined);
+    await a.vault.unlockWithPassword('A', 'ok'); await f.flush();
+    await a.load('src/services/wallet/lock.js').default();
+    assert.equal(announced, true); assert.equal(a.vault.isUnlocked(), false);
+    await a.vault.unlockWithPassword('B', 'ok'); notification.resolve(true); await f.flush();
+    assert.equal(a.vault.getWalletName(), 'B'); assert.equal(a.vault.isUnlocked(), true);
+  }
+  // Real menu callbacks catch incomplete global lock without navigating or
+  // resetting wallet state, and the same action succeeds on explicit retry.
+  for (const label of ['Lock wallet', 'Add wallet']) {
+    const f = fixture(); const routes = []; const actions = []; const errors = []; let invalidations = 0;
+    const a = f.realm('menu', id => {
+      if (id === 'react-router-dom') return { useNavigate: () => (...args) => routes.push(args) };
+      if (id === 'react-redux') return { useDispatch: () => action => actions.push(action) };
+      if (id.endsWith('/hooks/useAccount')) return { invalidateAccountCache: () => invalidations++ };
+      if (id.endsWith('/redux/pendingTransactionsSlice')) return { resetPendingTransactions: () => ({ type: 'resetPendingTransactions' }) };
+      if (id.endsWith('/utils/notify')) return { notify: { dismissAll() {}, error: error => errors.push(error) } };
+    });
+    await a.vault.unlockWithPassword('A', 'ok'); await f.flush();
+    const menu = a.load('src/components/burger-popover/burger-popover.js').default({});
+    const item = React.Children.toArray(menu.props.children).find(child => child.props.children === label);
+    assert(item);
+    f.state.failWrite = true; await item.props.onClick();
+    assert.equal(errors[0].code, 'WALLET_LOCK_FAILED'); assert.equal(routes.length, 0); assert.equal(actions.length, 0); assert.equal(invalidations, 0);
+    f.state.failWrite = false; await item.props.onClick();
+    assert.equal(routes.at(-1)[0], label === 'Lock wallet' ? '/password' : '/auth/onboarding');
+    assert.equal(a.vault.isUnlocked(), false); assert.equal(invalidations, 1);
+  }
+  // Removal cannot erase the saved keystore before its lock commit succeeds.
+  {
+    const f = fixture(); const errors = []; const routes = []; let deletes = 0; let stateIndex = 0;
+    const a = f.realm('remove', id => {
+      if (id === 'react') return { ...React, useState: () => [[ 'ok', 'REMOVE', false ][stateIndex++], () => {}] };
+      if (id === 'react-router-dom') return { useNavigate: () => (...args) => routes.push(args) };
+      if (id === 'react-redux') return { useDispatch: () => () => {}, useSelector: fn => fn({ wallet: { walletName: 'A' } }) };
+      if (id.endsWith('/hooks/useAccount')) return { invalidateAccountCache() {} };
+      if (id.endsWith('/redux/pendingTransactionsSlice')) return { resetPendingTransactions: () => ({ type: 'resetPendingTransactions' }) };
+      if (id.endsWith('/utils/utils')) return { removeStorageWallet: () => { deletes++; return true; }, loadStorageWalletNames: () => [] };
+      if (id.endsWith('/utils/notify')) return { notify: { dismissAll() {}, success() {}, error: error => errors.push(error) } };
+    });
+    await a.vault.unlockWithPassword('A', 'ok'); await f.flush();
+    const element = a.load('src/pages/settings/reset-wallet/reset-wallet.js').default();
+    const actionRow = React.Children.toArray(element.props.children).at(-1);
+    const remove = React.Children.toArray(actionRow.props.children).at(-1).props.onClick;
+    f.state.failWrite = true; await remove();
+    assert.equal(errors[0].code, 'WALLET_LOCK_FAILED'); assert.equal(deletes, 0); assert.equal(routes.length, 0);
+    f.state.failWrite = false; await remove();
+    assert.equal(deletes, 1); assert.equal(routes.at(-1)[0], '/auth/onboarding');
   }
   // Password encryption is deliberately outside the lock; only an authorized
   // synchronous commit can replace the encrypted wallet. No late write or toast.

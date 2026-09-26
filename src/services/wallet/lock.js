@@ -13,9 +13,25 @@ import vault from './vault';
 // told connected sites the address was gone, so a site kept showing an account
 // for a wallet the person believed they had just shut.
 const lockWallet = async () => {
+  // A local password screen must not claim a global lock before the shared
+  // lease has actually been revoked. Retry a transient storage fault once;
+  // an unresolved failure stays visible and can be retried by the caller.
+  let generation;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try { generation = await session.clear(); break; }
+    catch (error) {
+      if (attempt === 1) {
+        throw Object.assign(new Error('Could not lock all wallet windows. Try Lock again or close the browser.'), {
+          code: 'WALLET_LOCK_FAILED',
+        });
+      }
+    }
+  }
   vault.lock();
-  const generation = await session.clear();
-  await announceLock(generation);
+  // Provider notification is best effort and generation-checked by the worker.
+  // Do not let its timeout keep an old menu/removal continuation alive after
+  // the password screen is already available for a new unlock.
+  announceLock(generation);
   // Nothing left over from the unlocked wallet should still be on screen once
   // the password prompt is.
   notify.dismissAll();

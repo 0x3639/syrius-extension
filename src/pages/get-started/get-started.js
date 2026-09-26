@@ -7,7 +7,7 @@ import { KeyStoreManager } from 'znn-ts-sdk';
 import NavBack from '../../components/nav-back/nav-back';
 import OrderWords from '../../components/order-words/order-words';
 import ProgressSteps from '../../components/progress-steps/progress-steps';
-import fallbackValues from '../../services/utils/fallbackValues';
+import { validateWalletPassword, saveWalletWithPassword } from '../../services/wallet/password';
 import { arrayShuffle, loadStorageWalletNames, sanitizeWalletName } from '../../services/utils/utils';
 import { copyToClipboard, notify } from '../../services/utils/notify';
 import { completeUnlock } from '../../services/wallet/bootstrap';
@@ -45,8 +45,6 @@ const GetStarted = () => {
     formState: { errors },
     setValue,
   } = useForm();
-
-  const { strongRegex, passwordCriteria } = fallbackValues.passwordValidationInfo;
 
   const validateWalletName = (name) => {
     if (!name?.trim()) {
@@ -88,7 +86,7 @@ const GetStarted = () => {
       const storageName = sanitizeWalletName(walletName);
       // Awaited, unlike before: nothing may claim the wallet exists until it
       // has actually been written.
-      await new KeyStoreManager().saveKeyStore(keyStore, password, storageName);
+      await saveWalletWithPassword(keyStore, password, storageName);
 
       // Straight into the wallet with the password just chosen, rather than
       // sending somebody to a login screen they have every reason to think
@@ -134,7 +132,7 @@ const GetStarted = () => {
             <input
               {...register('passwordField', {
                 required: true,
-                validate: (value) => strongRegex.test(value) || passwordCriteria,
+                validate: validateWalletPassword,
               })}
               className={`w-100 custom-label ${errors.passwordField ? 'custom-label-error' : ''}`}
               placeholder="Password"

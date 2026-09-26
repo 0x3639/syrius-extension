@@ -10,11 +10,24 @@ const babel = require('@babel/core');
 const root = path.join(__dirname, '..');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'syrius-live-vault-'));
 const ext = path.join(dir, 'extension'); fs.mkdirSync(ext);
-const compile = file => babel.transformFileSync(path.join(root, file), { presets: [['@babel/preset-env', { targets: { chrome: '111' } }]], babelrc: false, configFile: false }).code;
+const compile = file => babel.transformFileSync(path.join(root, file), { presets: [['@babel/preset-env', { targets: { chrome: '111' } }], '@babel/preset-react'], babelrc: false, configFile: false }).code;
 const factory = (name, file) => `${JSON.stringify(name)}: function(module, exports, require) {\n${compile(file)}\n}`;
-const sources = [factory('lease', 'src/services/wallet/sessionLease.js'), factory('session', 'src/services/wallet/session.js'), factory('vault', 'src/services/wallet/vault.js')];
+const sources = [factory('lease', 'src/services/wallet/sessionLease.js'), factory('session', 'src/services/wallet/session.js'), factory('vault', 'src/services/wallet/vault.js'), factory('main', 'src/layouts/mainLayout/mainLayout.js')];
 const pageScript = `
-const fixture = { settings: { autoLockMinutes: 15 }, signs: 0, locks: 0 };
+const fixture = { settings: { autoLockMinutes: 15 }, signs: 0, locks: 0, pathname: '/site-integration', restores: 0, failRead: false, failWrite: false, readFailures: 0, writeFailures: 0 };
+const originalGet = chrome.storage.session.get.bind(chrome.storage.session);
+const originalSet = chrome.storage.session.set.bind(chrome.storage.session);
+chrome.storage.session.get = (...args) => {
+  if (fixture.failRead || fixture.readFailures > 0) { fixture.readFailures--; return Promise.reject(Error('Synthetic session read failure')); }
+  return originalGet(...args);
+};
+chrome.storage.session.set = (...args) => {
+  if (fixture.failWrite || fixture.writeFailures > 0) { fixture.writeFailures--; return Promise.reject(Error('Synthetic session write failure')); }
+  return originalSet(...args);
+};
+const dispatch = () => {};
+const navigate = to => { fixture.pathname = to; };
+const action = () => ({});
 const address = text => ({ toString: () => text });
 class KeyStore {
   fromEntropy(entropy) { this.entropy = entropy; this.mnemonic = 'synthetic words'; return this; }
@@ -34,7 +47,32 @@ function load(name) {
   const module = { exports: {} }; cache[name] = module;
   factories[name](module, module.exports, id => {
     if (id === 'znn-ts-sdk') return sdk;
-    if (id === '../utils/storage') return { getSettings: () => fixture.settings };
+    if (id.endsWith('/utils/storage')) return { getSettings: () => fixture.settings, getCurrentNodeUrl: () => 'wss://example.invalid' };
+    if (id === 'react') return React;
+    if (id === 'react-router-dom') return { useLocation: () => ({ pathname: fixture.pathname }), useNavigate: () => navigate, Route: () => null, Routes: () => React.createElement('div', { id: 'wallet-routes' }, fixture.pathname) };
+    if (id === 'react-redux') return { useDispatch: () => dispatch };
+    if (id.endsWith('/wallet/session')) return load('session');
+    if (id.endsWith('/wallet/vault')) return load('vault');
+    if (id.endsWith('/wallet/bootstrap')) return { completeUnlock: async ({sessionRecord}) => {
+      fixture.restores++;
+      await vault.restore(sessionRecord);
+      if (fixture.restores === 1 && fixture.bootFault) {
+        fixture.readFailures = 1;
+        if (fixture.bootFault === 'cleanup-read') fixture.failRead = true;
+        else if (fixture.bootFault === 'transient') fixture.writeFailures = 1;
+        else fixture.failWrite = true;
+        // Exercise the actual failed post-adoption authorization and local
+        // purge, followed by MainLayout's generation-conditional cleanup.
+        await vault.assertSession();
+      }
+    } };
+    if (id.endsWith('/redux/walletSlice')) return { resetWalletState: action };
+    if (id.endsWith('/redux/pendingTransactionsSlice')) return { resetPendingTransactions: action };
+    if (id.endsWith('/hooks/useAccount')) return { invalidateAccountCache() {} };
+    if (id.endsWith('/utils/notify')) return { notify: { dismissAll() {} } };
+    if (id.endsWith('/utils/utils')) return { loadStorageWalletNames: () => ['synthetic-boot', 'synthetic-replacement'] };
+    if (id.endsWith('/utils/devWallet')) return { isDevWalletBuild: false };
+    if (id.includes('Layout/') || id.includes('/pages/') || id.endsWith('/splash/splash')) return () => React.createElement('div', null, 'Loading');
     return load({ './session': 'session', './sessionLease': 'lease' }[id]);
   });
   return module.exports;
@@ -45,12 +83,18 @@ globalThis.session = load('session').default;
 globalThis.lease = load('lease').default;
 vault.onLock(() => fixture.locks++);
 globalThis.worker = (method, ...args) => new Promise((resolve, reject) => chrome.runtime.sendMessage({kind:'lease-test',method,args}, response => chrome.runtime.lastError ? reject(Error(chrome.runtime.lastError.message)) : response.error ? reject(Error(response.error)) : resolve(response.result)));
+globalThis.mountStartup = () => {
+  fixture.reactRoot = ReactDOM.createRoot(document.getElementById('root'));
+  fixture.reactRoot.render(React.createElement(load('main').default));
+};
 globalThis.denied = operation => Promise.resolve().then(operation).then(() => false, error => error.code === 'WALLET_LOCKED');
 `;
 const workerSource = fs.readFileSync(path.join(root, 'src/services/wallet/sessionLease.js'), 'utf8').replace('export default sessionLease;', '');
 fs.writeFileSync(path.join(ext, 'manifest.json'), JSON.stringify({ manifest_version: 3, name: 'Isolated Syrius live vault test', version: '1.0', permissions: ['storage'], background: { service_worker: 'worker.js' } }));
 fs.writeFileSync(path.join(ext, 'worker.js'), workerSource + `\nchrome.runtime.onMessage.addListener((message, sender, reply) => { if (message.kind !== 'lease-test') return false; sessionLease[message.method](...message.args).then(result => reply({result}), error => reply({error:String(error)})); return true; });`);
-fs.writeFileSync(path.join(ext, 'page.html'), '<html><body>Isolated vault test<script src="page.js"></script></body></html>');
+fs.copyFileSync(path.join(root, 'node_modules/react/umd/react.production.min.js'), path.join(ext, 'react.js'));
+fs.copyFileSync(path.join(root, 'node_modules/react-dom/umd/react-dom.production.min.js'), path.join(ext, 'react-dom.js'));
+fs.writeFileSync(path.join(ext, 'page.html'), '<html><body><div id="root">Isolated vault test</div><script src="react.js"></script><script src="react-dom.js"></script><script src="page.js"></script></body></html>');
 fs.writeFileSync(path.join(ext, 'page.js'), pageScript);
 const browser = spawn(process.env.CHROMIUM_PATH || '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${path.join(dir, 'profile')}`, '--enable-unsafe-extension-debugging', '--disable-background-networking', '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
 let stderr = ''; browser.stderr.on('data', chunk => { stderr += chunk; });
@@ -117,6 +161,43 @@ let socket, cdp;
   await until(b, '!vault.isUnlocked() && fixture.locks > 1');
   assert.equal(await evaluate(b, 'denied(() => short.sign(new Uint8Array([4])))'), true);
   assert.equal(await evaluate(a, "(await chrome.storage.session.get('znn.unlock'))['znn.unlock'].entropy === undefined"), true);
-  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, profile: dir }));
+  // Real React MainLayout, actual vault/session/lease modules, native MV3
+  // storage in two pages. Only the injected faults and key material are fake.
+  for (const mode of ['normal', 'read', 'cleanup-read', 'cleanup-write', 'transient', 'replacement']) {
+    await evaluate(b, "fixture.settings.autoLockMinutes = 15");
+    const bootId = await evaluate(b, "(async () => { const scope = await vault.unlockWithPassword('synthetic-boot','ok'); globalThis.bootSigner = await vault.getSigningKeyPair(); return scope.id; })()");
+    const startup = await openPage();
+    await evaluate(startup, `fixture.bootFault = ${JSON.stringify(['normal', 'read'].includes(mode) ? null : mode)}, fixture.failRead = ${mode === 'read'}, mountStartup()`);
+    if (['normal', 'transient'].includes(mode)) {
+      await until(startup, "Boolean(document.getElementById('wallet-routes'))");
+      assert.equal(await evaluate(startup, "Boolean(document.querySelector('[role=alert]'))"), false);
+      if (mode === 'normal') assert.equal(await evaluate(startup, 'vault.capture().id'), bootId);
+      else {
+        assert.equal(await evaluate(startup, 'fixture.pathname'), '/password');
+        assert.equal(await evaluate(b, 'denied(() => bootSigner.sign(new Uint8Array([5])))'), true);
+      }
+    } else {
+      await until(startup, "Boolean(document.querySelector('[role=alert]'))");
+      assert.equal(await evaluate(startup, "Boolean(document.getElementById('wallet-routes'))"), false);
+      assert.match(await evaluate(startup, "document.querySelector('[role=alert]').textContent"), mode === 'read' ? /Other wallet windows may still be unlocked/ : /Could not lock all wallet windows/);
+      assert.equal(await evaluate(b, "(await chrome.storage.session.get('znn.unlock'))['znn.unlock'].id"), bootId);
+      let replacementId;
+      if (mode === 'replacement') replacementId = await evaluate(b, "(await vault.unlockWithPassword('synthetic-replacement','ok')).id");
+      await evaluate(startup, "fixture.failRead = fixture.failWrite = false, document.querySelector('button').click()");
+      await until(startup, "Boolean(document.getElementById('wallet-routes'))");
+      if (replacementId) {
+        assert.equal(await evaluate(startup, 'vault.capture().id'), replacementId);
+        assert.equal(await evaluate(b, "(await chrome.storage.session.get('znn.unlock'))['znn.unlock'].id"), replacementId);
+        assert.equal(await evaluate(b, 'vault.getAddress()'), 'synthetic-replacement:0');
+      } else if (mode === 'read') {
+        assert.equal(await evaluate(startup, 'vault.capture().id'), bootId);
+      } else {
+        assert.equal(await evaluate(startup, 'fixture.pathname'), '/password');
+        assert.equal(await evaluate(b, 'denied(() => bootSigner.sign(new Uint8Array([6])))'), true);
+      }
+    }
+    await cdp('Target.closeTarget', {targetId: startup.targetId});
+  }
+  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, actualStartupErrorAndRetryUI: true, replacementLeasePreserved: true, profile: dir }));
   await cdp('Browser.close'); socket.close();
 })().catch(async error => { console.error(error.stack || String(error)); if (cdp) await cdp('Browser.close').catch(() => {}); socket?.close(); browser.kill(); process.exitCode = 1; });

@@ -16,17 +16,7 @@ const lockWallet = async () => {
   // A local password screen must not claim a global lock before the shared
   // lease has actually been revoked. Retry a transient storage fault once;
   // an unresolved failure stays visible and can be retried by the caller.
-  let generation;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try { generation = await session.clear(); break; }
-    catch (error) {
-      if (attempt === 1) {
-        throw Object.assign(new Error('Could not lock all wallet windows. Try Lock again or close the browser.'), {
-          code: 'WALLET_LOCK_FAILED',
-        });
-      }
-    }
-  }
+  const generation = await session.clear();
   vault.lock();
   // Provider notification is best effort and generation-checked by the worker.
   // Do not let its timeout keep an old menu/removal continuation alive after

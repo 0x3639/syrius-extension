@@ -284,7 +284,7 @@ const fixture = () => {
     if (transient) f.state[phase === 'read' ? 'readFailures' : 'writeFailures'] = 1;
     else f.state[failureKey] = true;
     if (!transient) {
-      await assert.rejects(lockWallet(), error => error.code === 'WALLET_LOCK_FAILED' && /Try Lock again/.test(error.message));
+      await assert.rejects(lockWallet(), error => error.code === 'WALLET_LOCK_FAILED' && /Try again/.test(error.message));
       assert.equal(localLocks, 0); assert.equal(a.vault.isUnlocked(), true);
       assert.equal(b.vault.isUnlocked(), true); assert.equal(a.messages.length, 0);
       f.state[failureKey] = false;
@@ -434,6 +434,94 @@ const fixture = () => {
     assert.equal(f.state.storage[a.session.sessionKey].id, newer.id);
     unsubscribe();
   }
+  // Actual startup UI: failed shared cleanup is an error with an identity-
+  // preserving retry, never a successful password screen. A read failure is
+  // also distinct from a known absent session. Fixtures use synthetic stores.
+  for (const mode of ['normal', 'read', 'cleanup-read', 'cleanup-write', 'transient', 'replacement']) {
+    const f = fixture(); const existing = f.realm('existing');
+    await existing.vault.unlockWithPassword('A', 'ok');
+    const oldId = existing.vault.capture().id;
+    const oldSigner = await existing.vault.getSigningKeyPair();
+    const states = [], refs = [], effects = [], routes = [];
+    let stateIndex, refIndex, effectIndex, restores = 0, boot;
+    const mockReact = { ...React,
+      useState: initial => {
+        const index = stateIndex++;
+        if (!(index in states)) states[index] = initial;
+        return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+      },
+      useRef: initial => { const index = refIndex++; return refs[index] ||= { current: initial }; },
+      useEffect: (fn, deps) => { effects[effectIndex++] = { fn, deps }; },
+    };
+    const a = f.realm('boot', id => {
+      if (id === 'react') return mockReact;
+      if (id === 'react-router-dom') return { useLocation: () => ({ pathname: '/site-integration' }), useNavigate: () => (...args) => routes.push(args), Route: 'route', Routes: 'routes' };
+      if (id === 'react-redux') return { useDispatch: () => () => {} };
+      if (/Layout\/(authLayout|tabsLayout|siteIntegrationLayout)$|dashboard-password|initial-node-selection|splash\/splash/.test(id)) return () => null;
+      if (id.endsWith('/utils/utils')) return { loadStorageWalletNames: () => ['A', 'B'] };
+      if (id.endsWith('/utils/devWallet')) return { isDevWalletBuild: false };
+      if (id.endsWith('/hooks/useAccount')) return { invalidateAccountCache() {} };
+      if (id.endsWith('/redux/pendingTransactionsSlice')) return { resetPendingTransactions: () => ({ type: 'resetPendingTransactions' }) };
+      if (id.endsWith('/wallet/bootstrap')) return { completeUnlock: async ({ sessionRecord }) => {
+        restores++;
+        await a.vault.restore(sessionRecord);
+        if (restores === 1 && !['normal', 'read'].includes(mode)) {
+          if (mode === 'cleanup-read') f.state.failRead = true;
+          else if (mode === 'transient') f.state.writeFailures = 1;
+          else f.state.failWrite = true;
+          throw Error('Synthetic post-adoption restore failure');
+        }
+      } };
+    });
+    const MainLayout = a.load('src/layouts/mainLayout/mainLayout.js').default;
+    const render = () => { stateIndex = refIndex = effectIndex = 0; return MainLayout(); };
+    const start = () => {
+      render(); boot = effects.find(effect => effect.deps?.length === 1 && typeof effect.deps[0] === 'number');
+      assert(boot); return boot.fn();
+    };
+    render(); const unsubscribe = effects.find(effect => effect.deps?.length === 2).fn();
+    if (mode === 'read') f.state.failRead = true;
+    let cancel = start(); await f.flush(); await f.flush();
+    let tree = render();
+    if (['normal', 'transient'].includes(mode)) {
+      assert.equal(tree.props.className, 'main-layout');
+      assert.equal(routes.at(-1)?.[0], mode === 'normal' ? undefined : '/password');
+      if (mode === 'normal') {
+        assert.equal(a.vault.capture().id, oldId);
+        assert.equal(f.state.storage[a.session.sessionKey].id, oldId);
+      } else {
+        await assert.rejects(oldSigner.sign(new Uint8Array([1])), locked);
+        assert.equal(routes.at(-1)[1].state.returnTo, '/site-integration');
+      }
+    } else {
+      assert.equal(tree.props.role, 'alert');
+      const children = React.Children.toArray(tree.props.children);
+      assert.match(children[1].props.children, mode === 'read' ? /Other wallet windows may still be unlocked/ : /Could not lock all wallet windows/);
+      assert.equal(f.state.storage[a.session.sessionKey].id, oldId);
+      assert.equal(restores, mode === 'read' ? 0 : 1);
+      f.state.failRead = f.state.failWrite = false;
+      let replacement;
+      if (mode === 'replacement') {
+        replacement = await existing.vault.unlockWithPassword('B', 'ok'); await f.flush();
+      }
+      cancel(); children.at(-1).props.onClick(); cancel = start(); await f.flush(); await f.flush();
+      tree = render(); assert.equal(tree.props.className, 'main-layout');
+      if (replacement) {
+        assert.equal(f.state.storage[a.session.sessionKey].id, replacement.id);
+        assert.equal(a.vault.getWalletName(), 'B');
+        assert.equal(await existing.vault.getAddress(), 'B:0');
+      } else if (mode === 'read') {
+        assert.equal(a.vault.capture().id, oldId); assert.equal(existing.vault.isUnlocked(), true);
+      } else {
+        await assert.rejects(oldSigner.sign(new Uint8Array([1])), locked);
+        assert.equal(f.state.storage[a.session.sessionKey].entropy, undefined);
+        assert.equal(routes.at(-1)[0], '/password');
+        assert.equal(routes.at(-1)[1].state.returnTo, '/site-integration');
+      }
+    }
+    cancel(); unsubscribe();
+  }
+
   // Installed SDK controls: real derivation, public address/key, Ed25519
   // signing/verification, and its complete block pipeline with an inert ledger.
   // Delayed RPC/PoW responses occur outside the lease critical section, so a

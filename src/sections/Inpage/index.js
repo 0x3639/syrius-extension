@@ -26,6 +26,7 @@
   const pending = new Map();
   const listeners = new Map();
   let requestCounter = 0;
+  let active = true;
 
   const nextId = () => {
     requestCounter += 1;
@@ -39,6 +40,7 @@
 
   const request = ({ method, params }) =>
     new Promise((resolve, reject) => {
+      if (!active) { reject({ code: 4900, message: 'This document is no longer active. Make a new request after returning.' }); return; }
       const id = nextId();
       const needsApproval = method !== 'znn_accounts' && method !== 'znn_chainId' && method !== 'znn_nodeUrl';
 
@@ -193,6 +195,20 @@
       return provider;
     },
   };
+
+  // Reject actual provider promises synchronously when leaving. A posted
+  // cancellation message could itself wait in the BFCache task queue.
+  window.addEventListener('pagehide', () => {
+    active = false;
+    for (const waiting of pending.values()) {
+      clearTimeout(waiting.timer);
+      waiting.reject({ code: 4900, message: 'The page left before this request completed. Make a new request after returning.' });
+    }
+    pending.clear();
+    provider.accounts = [];
+    provider.chainId = null;
+  });
+  window.addEventListener('pageshow', () => { active = true; });
 
   // A page that loaded before the wallet did gets told, rather than having to
   // poll for `window.zenon`.

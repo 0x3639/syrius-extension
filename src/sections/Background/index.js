@@ -1,6 +1,7 @@
 import frames from './frames';
 import permissions from './permissions';
 import requests from './requests';
+import { targetFrom, validRequest, isLive, deliver, requestEnded } from '../../services/utils/documentBinding';
 
 // The service worker.
 //
@@ -91,17 +92,8 @@ const getPublicState = async () => {
 //
 // Talking back to pages
 //
-const sendToTab = async (tabId, message, frameId) => {
-  try {
-    await chrome.tabs.sendMessage(tabId, message, frameId === undefined ? {} : { frameId });
-  } catch (err) {
-    // The tab navigated away or closed. Nothing to deliver to and nothing to
-    // do about it.
-  }
-};
-
 const respond = (target, id, result, error) =>
-  sendToTab(target.tabId, { channel: 'znn', kind: 'response', id, result, error }, target.frameId);
+  deliver(target, { channel: 'znn', kind: 'response', id, result, error });
 
 // Fans an event out to every frame whose origin is connected, so a site sees
 // an address or chain change without polling.
@@ -115,9 +107,11 @@ const broadcast = async (event, data) => {
   const targets = await frames.forTabs(origins);
 
   await Promise.all(
-    targets.map((frame) =>
-      sendToTab(frame.tabId, { channel: 'znn', kind: 'event', event, data }, frame.frameId)
-    )
+    targets.map(async (frame) => {
+      if (!(await deliver(frame, { channel: 'znn', kind: 'event', event, data }))) {
+        await frames.forgetTarget(frame);
+      }
+    })
   );
 };
 
@@ -125,23 +119,22 @@ const broadcast = async (event, data) => {
 // Queuing something for a person to approve
 //
 const queueApproval = async (type, { id, target, origin, sender, params }) => {
-  await requests.add({
-    id,
-    type,
-    params: params || {},
-    origin,
-    tabId: target.tabId,
-    frameId: target.frameId,
-    title: sender.tab?.title || '',
-    favicon: sender.tab?.favIconUrl || '',
-    createdAt: Date.now(),
-  });
-  // Stamped with the window it is actually shown in, so that closing that
-  // window answers for this request and for no other. See requests.attachWindow
-  // — without it, a request queued in the gap between one window closing and
-  // the next opening was rejected as "user rejected" without ever being drawn.
-  const windowId = await requests.openApprovalWindow();
-  await requests.attachWindow(id, windowId);
+  const request = {
+    id, type, params: params || {}, origin, ...target,
+    title: sender.tab?.title || '', favicon: sender.tab?.favIconUrl || '', createdAt: Date.now(),
+  };
+  if (!(await isLive(request, true))) throw requestEnded();
+  await requests.add(request);
+  try {
+    if (!(await requests.current(request))) throw requestEnded();
+    const windowId = await requests.openApprovalWindow();
+    if (!(await requests.attachWindow(id, windowId, request)) || !(await requests.current(request))) {
+      throw requestEnded();
+    }
+  } catch (error) {
+    await requests.remove(id, request);
+    throw error;
+  }
 };
 
 //
@@ -230,7 +223,7 @@ const providerMethods = {
 
 const handleProviderRequest = async (request, sender) => {
   const origin = permissions.originOf(sender);
-  const target = { tabId: sender.tab.id, frameId: sender.frameId ?? 0 };
+  const target = targetFrom(sender, request);
   const { id, method, params } = request;
 
   if (!origin) {
@@ -268,11 +261,14 @@ const handleProviderRequest = async (request, sender) => {
 //
 const internalMethods = {
   // The approval screens ask what they are being opened for.
-  'approvals.list': () => requests.list(),
+  'approvals.list': () => requests.listCurrent(),
   'approvals.next': () => requests.oldest(),
+  'approvals.current': async ({ binding }) => Boolean(await requests.current(binding)),
 
-  'approvals.resolve': async ({ id, result, grantOrigin }) => {
-    const request = await requests.remove(id);
+  'approvals.resolve': async ({ binding, result, grantOrigin }) => {
+    const active = await requests.current(binding);
+    if (!active) return false;
+    const request = await requests.remove(active.id, active);
 
     if (!request) {
       return false;
@@ -280,17 +276,19 @@ const internalMethods = {
     if (grantOrigin) {
       await permissions.grant(request.origin, { title: request.title, favicon: request.favicon });
     }
-    await respond(request, id, result);
+    await respond(request, request.id, result);
     return true;
   },
 
-  'approvals.reject': async ({ id, error }) => {
-    const request = await requests.remove(id);
+  'approvals.reject': async ({ binding, error }) => {
+    const active = await requests.current(binding);
+    if (!active) return false;
+    const request = await requests.remove(active.id, active);
 
     if (!request) {
       return false;
     }
-    await respond(request, id, undefined, error || errors.userRejected);
+    await respond(request, request.id, undefined, error || errors.userRejected);
     return true;
   },
 
@@ -345,21 +343,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // A content script announcing itself, so events can be delivered to it later
   // without the `tabs` permission. Nothing is trusted from the message body —
   // the origin is the one Chrome attributes to the sender.
-  if (message.channel === 'znn' && message.kind === 'hello') {
-    if (isFromContentScript(sender)) {
-      frames.register(sender, permissions.originOf(sender));
-    }
+  if (message.channel === 'znn' && ['hello', 'bye'].includes(message.kind)) {
+    if (!isFromContentScript(sender)) return false;
+    const target = targetFrom(sender, message);
+    if (!target) { sendResponse({ accepted: false, error: errors.disconnected }); return false; }
+    const operation = message.kind === 'hello'
+      ? frames.register(target, permissions.originOf(sender))
+      : Promise.all([frames.forgetTarget(target), requests.cancelDocument(target)]);
+    Promise.resolve(operation).catch(() => {});
+    sendResponse({ accepted: true });
     return false;
   }
 
   if (message.channel === 'znn' && message.kind === 'request') {
-    // Only ever from a content script, and the origin comes from `sender`.
-    if (!isFromContentScript(sender)) {
+    if (!isFromContentScript(sender)) return false;
+    const target = targetFrom(sender, message);
+    if (!validRequest(target)) {
+      sendResponse({ accepted: false, error: { code: 4900, message: 'The requesting document could not be identified. Reload the page.' } });
       return false;
     }
-    handleProviderRequest(message, sender);
-    // Answered later over `chrome.tabs.sendMessage`, not through this callback:
-    // an approval outlives the message channel and, often, the worker itself.
+    // The callback acknowledges transport only. Human approval is answered
+    // later to this exact native document and private relay request token.
+    handleProviderRequest(message, sender).catch(() => {});
     sendResponse({ accepted: true });
     return false;
   }
@@ -410,15 +415,15 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 
   await Promise.all(
     abandoned.map(async (request) => {
-      await requests.remove(request.id);
-      await respond(request, request.id, undefined, errors.userRejected);
+      const removed = await requests.remove(request.id, request);
+      if (removed) await respond(removed, removed.id, undefined, errors.userRejected);
     })
   );
 });
 
 // A closed tab has no frames left to deliver to.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  frames.forgetTab(tabId);
+  Promise.all([frames.forgetTab(tabId), requests.cancelTab(tabId)]).catch(() => {});
 });
 
 // The popup enforces the auto-lock whenever it opens, but the popup is usually

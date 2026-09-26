@@ -1,3 +1,5 @@
+import { isLive, sameDocument } from '../../services/utils/documentBinding';
+
 // Which frames currently have this wallet injected, and what origin each one
 // is.
 //
@@ -33,22 +35,23 @@ const writeAll = async (frames) => {
   }
 };
 
-const register = async (sender, origin) => {
+const serialized = operation => navigator.locks.request(storageKey, operation);
+const register = (target, origin) => serialized(async () => {
+  // Probe inside the registration ordering: a delayed hello cannot replace a
+  // newer activation, and the map still has only one entry per tab/frame.
+  if (!(await isLive(target))) return false;
   const frames = await readAll();
-  frames[keyOf(sender.tab.id, sender.frameId ?? 0)] = {
-    tabId: sender.tab.id,
-    frameId: sender.frameId ?? 0,
-    origin,
-  };
+  frames[keyOf(target.tabId, target.frameId)] = { ...target, origin };
   await writeAll(frames);
-};
+  return true;
+});
 
 const forTabs = async (origins) => {
   const frames = await readAll();
   return Object.values(frames).filter((frame) => origins.has(frame.origin));
 };
 
-const forget = async (predicate) => {
+const forget = (predicate) => serialized(async () => {
   const frames = await readAll();
   let changed = false;
 
@@ -61,10 +64,12 @@ const forget = async (predicate) => {
   if (changed) {
     await writeAll(frames);
   }
-};
+});
+
+const forgetTarget = target => forget(frame => sameDocument(frame, target));
 
 const forgetTab = (tabId) => forget((frame) => frame.tabId === tabId);
 
-const frames = { storageKey, register, forTabs, forget, forgetTab };
+const frames = { storageKey, register, forTabs, forget, forgetTab, forgetTarget };
 
 export default frames;

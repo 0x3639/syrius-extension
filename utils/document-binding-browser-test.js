@@ -19,7 +19,14 @@ const compile = file => babel.transformFileSync(path.join(root, file), {
 }).code;
 const files = ['src/sections/Background/index.js', 'src/sections/Background/requests.js',
   'src/sections/Background/frames.js', 'src/sections/Background/permissions.js', 'src/services/utils/documentBinding.js'];
-write('worker.js', `const factories={${files.map(file => `${JSON.stringify(file)}:(module,exports,require)=>{${compile(file)}\n}`).join(',')}};
+write('worker.js', `// Fixture-only storage scheduler; the imported application modules are unchanged.
+let permissionGate; const nativeSet=chrome.storage.local.set.bind(chrome.storage.local);
+chrome.storage.local.set=async values=>{if(permissionGate&&values['syrius.permissions']&&Object.values(values['syrius.permissions']).some(entry=>entry.pendingApproval)){
+const gate=permissionGate;gate.entered=true;await gate.wait;permissionGate=null;}return nativeSet(values);};
+chrome.runtime.onMessage.addListener((message,sender,reply)=>{if(message.channel!=='fixture'||sender.url!==chrome.runtime.getURL('control.html'))return false;
+if(message.method==='hold'){let release;const wait=new Promise(resolve=>{release=resolve;});permissionGate={wait,release,entered:false};reply(true);}
+if(message.method==='entered')reply(Boolean(permissionGate?.entered));if(message.method==='release'){permissionGate?.release();reply(true);}return false;});
+const factories={${files.map(file => `${JSON.stringify(file)}:(module,exports,require)=>{${compile(file)}\n}`).join(',')}};
 const cache={}; const load=name=>{if(cache[name])return cache[name].exports;const module=cache[name]={exports:{}};
 factories[name](module,module.exports,id=>{let p=new URL(id,'https://bundle/'+name).pathname.slice(1);if(!p.endsWith('.js'))p+='.js';return load(p);});return module.exports;};load('src/sections/Background/index.js');`);
 for (const [name, file] of [['content.js', 'Content'], ['inpage.js', 'Inpage']]) write(name, fs.readFileSync(path.join(root, `src/sections/${file}/index.js`), 'utf8'));
@@ -28,7 +35,8 @@ write('manifest.json', JSON.stringify({ manifest_version: 3, name: 'Syrius docum
   content_scripts: ['MAIN', 'ISOLATED'].map(world => ({ matches: ['http://*.test/*'], js: [world === 'MAIN' ? 'inpage.js' : 'content.js'], world, all_frames: true, run_at: 'document_start' })) }));
 write('control.html', '<!doctype html><script src="control.js"></script>');
 write('popup.html', '<!doctype html><title>Inert approval window</title><p>Lifecycle fixture: no signing UI.</p>');
-write('control.js', `globalThis.internal = async (method,params={})=>{const reply=await chrome.runtime.sendMessage({channel:'internal',method,params});if(reply.error)throw Error(reply.error);return reply.result;};
+write('control.js', `globalThis.fixture=method=>chrome.runtime.sendMessage({channel:'fixture',method});
+globalThis.internal = async (method,params={})=>{const reply=await chrome.runtime.sendMessage({channel:'internal',method,params});if(reply.error)throw Error(reply.error);return reply.result;};
 globalThis.records=async key=>(await chrome.storage.session.get(key))[key];
 globalThis.target=async (record,payload)=>{try{return await chrome.tabs.sendMessage(record.tabId,{channel:'znn',activation:record.activation,requestToken:record.requestToken,...payload},{frameId:record.frameId,documentId:record.documentId});}catch{return {accepted:false};}};`);
 let browser, socket, cdp, server;
@@ -128,11 +136,30 @@ const watchdog = setTimeout(() => { console.error('Native document fixture timed
   assert.notEqual(legacy[0].id, legacy[1].id);
   for (const request of legacy) assert.equal(await resolve(request), true);
   for (const current of [page, second]) await eventually(() => evaluate(current, 'legacy'), value => value.length === 1, 'legacy completion');
+  // Hold only provisional permission persistence in the fixture's browser API
+  // adapter. Real page navigation/cancellation must prevent its activation.
+  await begin(second); const canceledGrant = await waitRequest();
+  await evaluate(control, "fixture('hold')");
+  await evaluate(control, `(window.grantOutcome=null,internal('approvals.resolve',${JSON.stringify({ binding: canceledGrant, result: ['inert-approved-account'], grantOrigin: true })}).then(value=>{grantOutcome={value};},error=>{grantOutcome={error:String(error)};}),true)`);
+  await eventually(() => evaluate(control, "fixture('entered')"), Boolean, 'provisional grant write held');
+  await cdp('Page.navigate', { url: aOrigin + '/grant-replacement' }, second.sessionId); await ready(second, aOrigin + '/grant-replacement');
+  await eventually(() => evaluate(control, "records('znn.pendingRequests')"), value => !Object.values(value || {}).some(r => r.requestToken === canceledGrant.requestToken), 'native departure cancels held grant');
+  await evaluate(control, "fixture('release')");
+  await eventually(() => evaluate(control, 'grantOutcome'), Boolean, 'canceled grant completes');
+  assert.deepEqual(await evaluate(control, 'grantOutcome'), { value: false });
+  assert.deepEqual(await internal('permissions.list'), []);
+  await begin(second); const approvedGrant = await waitRequest();
+  assert.equal(await internal('approvals.resolve', { binding: approvedGrant, result: ['inert-approved-account'], grantOrigin: true }), true);
+  await eventually(() => evaluate(second, 'outcomes'), value => value.length === 1, 'native accepted connection');
+  assert.equal((await internal('permissions.list')).length, 1);
+  await cdp('Page.navigate', { url: aOrigin + '/after-accepted-grant' }, second.sessionId); await ready(second, aOrigin + '/after-accepted-grant');
+  assert.equal((await internal('permissions.list')).length, 1, 'completed consent survives later navigation');
+  await internal('permissions.revokeAll');
   await begin(second); const closing = await waitRequest();
   await cdp('Target.closeTarget', { targetId: second.targetId });
   await eventually(() => evaluate(control, "records('znn.pendingRequests')"), value => !Object.values(value || {}).some(r => r.tabId === closing.tabId), 'tab close cleanup');
   const result = { browser: version.Browser, actualModules: files.concat(['Content/index.js', 'Inpage/index.js']), nonSecureHttp: true, sameOriginNavigation: true,
-    crossOriginNavigation: true, nativeSubframeNavigation: true, bfcacheRestored: restored, oldApprovalsCancelled: true, freshRequestsAndEvents: true, independentLegacyTabs: true, tabCloseCleanup: true };
+    crossOriginNavigation: true, nativeSubframeNavigation: true, bfcacheRestored: restored, oldApprovalsCancelled: true, freshRequestsAndEvents: true, independentLegacyTabs: true, provisionalGrantCancellation: true, completedConsentSurvivesNavigation: true, tabCloseCleanup: true };
   fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify({ ...result, artifact: path.join(dir, 'result.json') }));
 })().catch(error => { console.error(error.stack || String(error)); process.exitCode = 1; }).finally(async () => {

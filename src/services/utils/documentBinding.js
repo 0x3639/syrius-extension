@@ -23,22 +23,21 @@ const requestEnded = () => Object.assign(new Error('This page request is no long
 // Never retry against just a frame: a new document can reuse that frame.
 const deliver = async (target, message) => {
   if (!validTarget(target)) return false;
-  try {
-    const reply = await chrome.tabs.sendMessage(target.tabId, {
-      ...message, activation: target.activation, requestToken: target.requestToken,
-    }, { frameId: target.frameId, documentId: target.documentId });
-    return reply?.accepted === true;
-  } catch (error) { return false; }
-};
-const isLive = async (target, requireRequest = false) => {
-  if (!validTarget(target) || (requireRequest && !validRequest(target))) return false;
   let timer;
   try {
-    return await Promise.race([
-      deliver(target, { channel: 'znn', kind: 'probe', requireRequest }),
-      new Promise(resolve => { timer = setTimeout(() => resolve(false), 5000); }),
+    const reply = await Promise.race([
+      chrome.tabs.sendMessage(target.tabId, {
+        ...message, activation: target.activation, requestToken: target.requestToken,
+      }, { frameId: target.frameId, documentId: target.documentId }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 5000); }),
     ]);
-  } finally { clearTimeout(timer); }
+    return reply?.accepted === true;
+  } catch (error) { return false; }
+  finally { clearTimeout(timer); }
+};
+const isLive = (target, requireRequest = false) => {
+  if (requireRequest && !validRequest(target)) return Promise.resolve(false);
+  return deliver(target, { channel: 'znn', kind: 'probe', requireRequest });
 };
 
 export { validTarget, validRequest, targetFrom, sameDocument, sameRequest, bindingOf, requestEnded, deliver, isLive };

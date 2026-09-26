@@ -258,7 +258,7 @@ const SiteIntegrationLayout = () => {
       await assertRequest();
       const result = await action({ request: shown, assertRequest });
       await assertRequest();
-      if (!(await sendInternal('approvals.resolve', { binding: operation.binding, result, grantOrigin }))) throw requestEnded();
+      if (!(await sendInternal('approvals.resolve', { binding: operation.binding, result, grantOrigin }, { timeoutMs: 20000 }))) throw requestEnded();
       if (success && mounted.current && latestOperation.current === operation &&
           (!requestRef.current || sameRequest(requestRef.current, shown))) notify.success(success);
     } catch (error) {

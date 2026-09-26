@@ -1,7 +1,7 @@
 import frames from './frames';
 import permissions from './permissions';
 import requests from './requests';
-import { targetFrom, validRequest, isLive, deliver, requestEnded } from '../../services/utils/documentBinding';
+import { targetFrom, validRequest, isLive, deliver, requestEnded, bindingOf } from '../../services/utils/documentBinding';
 
 // The service worker.
 //
@@ -268,14 +268,18 @@ const internalMethods = {
   'approvals.resolve': async ({ binding, result, grantOrigin }) => {
     const active = await requests.current(binding);
     if (!active) return false;
-    const request = await requests.remove(active.id, active);
-
-    if (!request) {
-      return false;
-    }
     if (grantOrigin) {
-      await permissions.grant(request.origin, { title: request.title, favicon: request.favicon });
+      return permissions.grant(active.origin, { title: active.title, favicon: active.favicon }, {
+        binding: bindingOf(active),
+        confirm: async () => {
+          if (!(await requests.current(active))) return false;
+          const request = await requests.remove(active.id, active);
+          return Boolean(request && await respond(request, request.id, result));
+        },
+      });
     }
+    const request = await requests.remove(active.id, active);
+    if (!request) return false;
     await respond(request, request.id, result);
     return true;
   },

@@ -32,7 +32,7 @@ const loader = (environment, override = () => undefined) => {
 };
 const fixture = () => {
   const session = {}, local = {}, documents = [], deliveries = [], incoming = [], storageListeners = [];
-  const timers = new Map(); let nextTimer = 0, windowCount = 0, worker, heldWrite, heldProbe, heldResponse;
+  const timers = new Map(); let nextTimer = 0, windowCount = 0, worker, heldWrite, heldProbe, heldResponse, heldPermissionWrite, failPermissionWrites = false;
   const tails = new Map();
   const navigator = { locks: { request: (name, operation) => {
     const result = (tails.get(name) || Promise.resolve()).then(operation);
@@ -45,6 +45,12 @@ const fixture = () => {
     storage[area] = {
       get: async keys => structuredClone(Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map(key => [key, data[key]]))),
       set: async values => {
+        if (area === 'local' && 'syrius.permissions' in values) {
+          if (heldPermissionWrite && heldPermissionWrite.matches(values['syrius.permissions'])) {
+            const gate = heldPermissionWrite; heldPermissionWrite = null; gate.started.resolve(); await gate.release.promise;
+          }
+          if (failPermissionWrites) throw Error('Synthetic permission storage failure');
+        }
         if (heldWrite && area === 'session' && pendingKey in values) {
           const gate = heldWrite; heldWrite = null; gate.started.resolve(); await gate.release.promise;
         }
@@ -114,6 +120,8 @@ const fixture = () => {
     load: file => worker.load(file), get windowCount() { return windowCount; },
     holdWrite: () => heldWrite = gate(), holdProbe: () => heldProbe = gate(),
     holdResponse: matches => heldResponse = { ...gate(), matches },
+    holdPermissionWrite: matches => heldPermissionWrite = { ...gate(), matches },
+    failPermissionWrites: value => { failPermissionWrites = value; },
     timeout: ms => { for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn(); } },
   };
 };
@@ -256,6 +264,78 @@ const watchdog = setTimeout(() => { console.error('Document regression fixture t
     const gate = f.holdWrite(); const pending = a.window.zenon.signMessage('canceled during persistence'); const denied = assert.rejects(pending);
     await gate.started.promise; a.hide(); gate.release.resolve(); await denied; await f.flush();
     assert.deepEqual(await f.internal('approvals.list'), []); assert.equal(f.windowCount, 0);
+  }
+  // Connection permission is provisional until the exact relay accepts it.
+  // Cancel before persistence or delivery for a top frame, subframe, and the
+  // same native document restored from BFCache: no new origin consent appears.
+  for (const phase of ['persistence', 'delivery']) for (const mode of ['top', 'subframe', 'bfcache']) {
+    const f = fixture(), a = f.page({ frameId: mode === 'subframe' ? 3 : 0 });
+    const promise = a.window.zenon.connect(); const denied = assert.rejects(promise, error => error.code === 4900);
+    await f.flush(); const request = await f.internal('approvals.next');
+    const gate = phase === 'persistence' ? f.holdPermissionWrite(() => true) : f.holdResponse(() => true);
+    const resolving = f.internal('approvals.resolve', { binding: request, result: ['synthetic-account'], grantOrigin: true });
+    await gate.started.promise; a.hide(); await denied; await f.flush();
+    let replacement;
+    if (mode === 'bfcache') { a.show(); replacement = a; }
+    else { a.routable = false; replacement = f.page({ frameId: request.frameId }); }
+    gate.release.resolve(); assert.equal(await resolving, false);
+    assert.equal(await f.load('src/sections/Background/permissions.js').default.isConnected('https://site.invalid'), false);
+    f.session['znn.unlock'] = { expiresAt: Date.now() + 60000 };
+    f.session['znn.publicState'] = { address: 'synthetic-account' };
+    assert.deepEqual(await replacement.window.zenon.getAccounts(), []);
+    const freshPromise = replacement.window.zenon.connect(); await f.flush();
+    const fresh = await f.internal('approvals.next'); assert(fresh); assert.notEqual(fresh.requestToken, request.requestToken);
+    await f.internal('approvals.resolve', { binding: fresh, result: ['synthetic-account'], grantOrigin: true });
+    assert.deepEqual(await freshPromise, ['synthetic-account']);
+  }
+  // If cleanup cannot persist, a stranded provisional is still inactive after
+  // worker restart. Reconnection cancellation preserves any prior consent.
+  for (const hadPrevious of [false, true]) {
+    const f = fixture(), a = f.page(); if (hadPrevious) f.connected('https://site.invalid');
+    const promise = a.window.zenon.connect(); const denied = assert.rejects(promise); await f.flush();
+    const request = await f.internal('approvals.next'); const gate = f.holdResponse(() => true);
+    const resolving = f.internal('approvals.resolve', { binding: request, result: ['synthetic-account'], grantOrigin: true });
+    await gate.started.promise; a.hide(); await denied; f.failPermissionWrites(true); gate.release.resolve();
+    assert.equal(await resolving, false); assert(f.local['syrius.permissions']['https://site.invalid'].pendingApproval);
+    f.restart();
+    assert.equal(await f.load('src/sections/Background/permissions.js').default.isConnected('https://site.invalid'), hadPrevious);
+  }
+  // Accepted delivery commits the connection before later navigation. Readers
+  // wait for final persistence, and a concurrent revoke cannot be overwritten.
+  {
+    const f = fixture(), a = f.page(); f.connected('https://other.invalid');
+    f.session['znn.unlock'] = { expiresAt: Date.now() + 60000 };
+    f.session['znn.publicState'] = { address: 'synthetic-account' };
+    const promise = a.window.zenon.connect(); await f.flush(); const request = await f.internal('approvals.next');
+    const gate = f.holdPermissionWrite(all => Boolean(all['https://site.invalid'] && !all['https://site.invalid'].pendingApproval));
+    const resolving = f.internal('approvals.resolve', { binding: request, result: ['synthetic-account'], grantOrigin: true });
+    await gate.started.promise; assert.deepEqual(await promise, ['synthetic-account']); a.hide(); a.routable = false;
+    const permissions = f.load('src/sections/Background/permissions.js').default;
+    let readFinished = false; const reading = permissions.isConnected('https://site.invalid').then(value => { readFinished = true; return value; });
+    const revoking = permissions.revoke('https://other.invalid'); await f.flush(); assert.equal(readFinished, false);
+    gate.release.resolve(); assert.equal(await resolving, true); assert.equal(await reading, true); await revoking;
+    assert.equal(await permissions.isConnected('https://other.invalid'), false);
+    const b = f.page(); assert.deepEqual(await b.window.zenon.connect(), ['synthetic-account']);
+  }
+  // An unacknowledged response cannot hold permission readers indefinitely or
+  // activate a grant. A later page departure also prevents a delayed delivery.
+  {
+    const f = fixture(), a = f.page(); const promise = a.window.zenon.connect(); const denied = assert.rejects(promise);
+    await f.flush(); const request = await f.internal('approvals.next'); const gate = f.holdResponse(() => true);
+    const resolving = f.internal('approvals.resolve', { binding: request, result: ['synthetic-account'], grantOrigin: true });
+    await gate.started.promise; f.timeout(5000); await f.flush(); assert.equal(await resolving, false);
+    assert.equal(await f.load('src/sections/Background/permissions.js').default.isConnected('https://site.invalid'), false);
+    a.hide(); await denied; gate.release.resolve(); await f.flush();
+    assert.equal(a.posted.some(m => m.kind === 'response' && m.result), false);
+  }
+  // A failed promotion cannot leave fresh active consent across worker restart.
+  {
+    const f = fixture(), a = f.page(); const promise = a.window.zenon.connect(); await f.flush(); const request = await f.internal('approvals.next');
+    const gate = f.holdPermissionWrite(all => Boolean(all['https://site.invalid'] && !all['https://site.invalid'].pendingApproval));
+    const resolving = f.internal('approvals.resolve', { binding: request, result: ['synthetic-account'], grantOrigin: true });
+    const failed = assert.rejects(resolving, /Synthetic permission storage failure/);
+    await gate.started.promise; assert.deepEqual(await promise, ['synthetic-account']); f.failPermissionWrites(true); gate.release.resolve(); await failed;
+    f.restart(); assert.equal(await f.load('src/sections/Background/permissions.js').default.isConnected('https://site.invalid'), false);
   }
   // Fresh per-operation wrappers preserve receiver binding and reject before
   // crypto or discard a late result; they never mutate the cached raw key.

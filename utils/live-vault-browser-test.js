@@ -55,7 +55,13 @@ function load(name) {
     if (id.endsWith('/wallet/vault')) return load('vault');
     if (id.endsWith('/wallet/bootstrap')) return { completeUnlock: async ({sessionRecord}) => {
       fixture.restores++;
-      await vault.restore(sessionRecord);
+      const lifetime = await vault.restore(sessionRecord);
+      if (fixture.holdFirstBoot && fixture.restores === 1) {
+        fixture.bootHeld = true;
+        await new Promise(resolve => { fixture.releaseBoot = resolve; });
+        try { await vault.assertSession(lifetime); }
+        finally { fixture.bootReleased = true; }
+      }
       if (fixture.restores === 1 && fixture.bootFault) {
         fixture.readFailures = 1;
         if (fixture.bootFault === 'cleanup-read') fixture.failRead = true;
@@ -242,6 +248,31 @@ let socket, cdp;
     await cdp('Target.closeTarget', { targetId: affected.targetId });
   }
 
-  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, actualStartupErrorAndRetryUI: true, runtimeAvailabilityErrorAndRetryUI: true, replacementLeasePreserved: true, profile: dir }));
+  // A retry may complete while the old startup still awaits its node. The
+  // old generation must not replace the new recovery state when it resumes.
+  for (const replacement of [false, true]) {
+    await evaluate(b, "fixture.settings.autoLockMinutes = 15, vault.unlockWithPassword('synthetic-boot','ok')");
+    const late = await openPage();
+    await evaluate(late, 'fixture.holdFirstBoot = true, mountStartup()');
+    await until(late, 'fixture.bootHeld === true');
+    await evaluate(late, 'fixture.failRead = true');
+    await evaluate(b, 'vault.touch()');
+    await until(late, "Boolean(document.querySelector('[role=alert]'))");
+    await evaluate(late, 'fixture.failRead = false');
+    let newer;
+    if (replacement) newer = await evaluate(b, "(await vault.unlockWithPassword('synthetic-replacement','ok')).id");
+    await evaluate(late, "document.querySelector('button').click()");
+    await until(late, "Boolean(document.getElementById('wallet-routes'))");
+    const destination = await evaluate(late, 'fixture.pathname');
+    assert.equal(destination, replacement ? '/site-integration' : '/password');
+    if (newer) assert.equal(await evaluate(late, 'vault.capture().id'), newer);
+    await evaluate(late, 'fixture.releaseBoot()');
+    await until(late, 'fixture.bootReleased === true');
+    assert.equal(await evaluate(late, "Boolean(document.getElementById('wallet-routes'))"), true);
+    assert.equal(await evaluate(late, 'fixture.pathname'), destination);
+    if (newer) assert.equal(await evaluate(late, 'vault.capture().id'), newer);
+    await cdp('Target.closeTarget', { targetId: late.targetId });
+  }
+  console.log(JSON.stringify({ browser: version.Browser, sharedTimedRestore: true, workerLockRevokesBothPages: true, staleHandleRejected: true, onCloseOwnerOnly: true, automaticExpiryAndCleanup: true, actualStartupErrorAndRetryUI: true, runtimeAvailabilityErrorAndRetryUI: true, lateStartupPreservesRetry: true, replacementLeasePreserved: true, profile: dir }));
   await cdp('Browser.close'); socket.close();
 })().catch(async error => { console.error(error.stack || String(error)); if (cdp) await cdp('Browser.close').catch(() => {}); socket?.close(); browser.kill(); process.exitCode = 1; });

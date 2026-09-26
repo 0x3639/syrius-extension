@@ -438,13 +438,15 @@ const fixture = () => {
   // Actual startup UI: failed shared cleanup is an error with an identity-
   // preserving retry, never a successful password screen. A read failure is
   // also distinct from a known absent session. Fixtures use synthetic stores.
-  for (const mode of ['normal', 'read', 'cleanup-read', 'cleanup-write', 'transient', 'replacement']) {
+  for (const mode of ['normal', 'read', 'cleanup-read', 'cleanup-write', 'transient', 'replacement', 'late-retry', 'late-replacement']) {
     const f = fixture(); const existing = f.realm('existing');
     await existing.vault.unlockWithPassword('A', 'ok');
     const oldId = existing.vault.capture().id;
     const oldSigner = await existing.vault.getSigningKeyPair();
     const states = [], refs = [], effects = [], routes = [];
     let stateIndex, refIndex, effectIndex, restores = 0, boot;
+    const lateStartup = mode.startsWith('late-');
+    const lateGate = deferred();
     const mockReact = { ...React,
       useState: initial => {
         const index = stateIndex++;
@@ -465,7 +467,12 @@ const fixture = () => {
       if (id.endsWith('/redux/pendingTransactionsSlice')) return { resetPendingTransactions: () => ({ type: 'resetPendingTransactions' }) };
       if (id.endsWith('/wallet/bootstrap')) return { completeUnlock: async ({ sessionRecord }) => {
         restores++;
-        await a.vault.restore(sessionRecord);
+        const lifetime = await a.vault.restore(sessionRecord);
+        if (restores === 1 && lateStartup) {
+          await lateGate.promise;
+          await a.vault.assertSession(lifetime);
+          return;
+        }
         if (restores === 1 && !['normal', 'read'].includes(mode)) {
           if (mode === 'cleanup-read') f.state.failRead = true;
           else if (mode === 'transient') f.state.writeFailures = 1;
@@ -484,6 +491,27 @@ const fixture = () => {
     if (mode === 'read') f.state.failRead = true;
     let cancel = start(); await f.flush(); await f.flush();
     let tree = render();
+    if (lateStartup) {
+      assert.equal(restores, 1);
+      f.state.failRead = true;
+      await assert.rejects(a.vault.assertSession(), unavailable);
+      tree = render(); assert.equal(tree.props.role, 'alert');
+      f.state.failRead = false;
+      let newer;
+      if (mode === 'late-replacement') newer = await existing.vault.unlockWithPassword('B', 'ok');
+      cancel(); React.Children.toArray(tree.props.children).at(-1).props.onClick();
+      cancel = start(); await f.flush(); await f.flush();
+      tree = render(); assert.equal(tree.props.className, 'main-layout');
+      const routeCount = routes.length;
+      if (newer) assert.equal(a.vault.capture().id, newer.id);
+      else assert.equal(routes.at(-1)[0], '/password');
+      lateGate.resolve(); await f.flush(); await f.flush();
+      tree = render(); assert.equal(tree.props.className, 'main-layout');
+      assert.equal(routes.length, routeCount);
+      if (newer) assert.equal(a.vault.capture().id, newer.id);
+      cancel(); unsubscribe();
+      continue;
+    }
     if (['normal', 'transient'].includes(mode)) {
       assert.equal(tree.props.className, 'main-layout');
       assert.equal(routes.at(-1)?.[0], mode === 'normal' ? undefined : '/password');

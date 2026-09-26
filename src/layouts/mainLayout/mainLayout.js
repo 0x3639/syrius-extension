@@ -85,7 +85,7 @@ const MainLayout = () => {
       if (!id) return;
       await session.clear(id);
       vault.lock(id);
-      if (pendingRevocation.current === id) {
+      if (!cancelled && pendingRevocation.current === id) {
         pendingRevocation.current = null;
         setIsBooting(true);
         setBootError(null);
@@ -96,6 +96,7 @@ const MainLayout = () => {
       // Retry the failed identity before attempting another restore. A newer
       // shared lease is preserved by the conditional clear.
       await revokeFailedRestore();
+      if (cancelled) return;
       // Creates the harness' wallet and points it at a node, before anything
       // asks whether this profile has a wallet at all. Compiled out of every
       // build that is not driven by the dev harness.
@@ -152,6 +153,9 @@ const MainLayout = () => {
           }
           return;
         } catch (err) {
+          // Retry owns the new startup. A late node/restore completion must
+          // not replace its recovery identity or screen state.
+          if (cancelled) return;
           // Do not show a successful locked state if shared cleanup fails.
           // The startup error view keeps this identity for an explicit retry.
           pendingRevocation.current = unlock.id;

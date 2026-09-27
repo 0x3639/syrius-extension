@@ -7,7 +7,7 @@ through `znn-ts-sdk`) and never leave the machine. The extension talks to a
 Zenon node of your choosing over a websocket, and to web pages through an
 injected provider that cannot do anything without being asked first.
 
-Current version: **0.3.3**, Manifest V3. What changed against the published
+Current version: **0.3.3**, Manifest V3, Chrome/Brave 112 or later. What changed against the published
 `MichZNN/syrius-extension` build is in [CHANGELOG.md](CHANGELOG.md); the working
 notes behind it are in [REFACTOR.md](REFACTOR.md).
 
@@ -285,3 +285,13 @@ MIT License - see the [LICENSE](LICENSE) file for details.
 ---
 
 **Disclaimer**: This is experimental software. Use at your own risk. Always verify transactions before signing.
+
+## Wallet request limits
+
+Approval requests expire 30 minutes after admission; another request never renews that deadline. The queue holds at most 16 pending requests globally, two per origin and one pending connection request per origin. Requests must fit 128 KiB of UTF-8 JSON including their queue metadata, depth 32 and 20,000 values. Correlation IDs are finite numbers or nonempty strings up to 128 characters; site titles are limited to 1,024 characters and favicon URLs to 4,096. Supported 16 KiB calldata in Base64, byte-array and Buffer-JSON forms remains accepted. Inputs exceeding a limit are rejected without truncation.
+
+Capacity/attention limits return retryable code `-32005`; invalid or oversized requests use `-32602`. An invalid correlation ID is not echoed. Unapproved expiry returns `-32006`. If processing has already begun, expiry or closure reports unknown outcome: check the result before retrying, since an already-started publication cannot be recalled. Provider and legacy transport fallbacks settle missing replies after 31 minutes with the same caution.
+
+A new approval window is limited to one per five seconds globally and one per 30 seconds per origin. Existing windows are reused without refocusing. A successful human approval permits that origin one follow-up opening within 30 seconds, including connect-then-sign after the empty-window grace; rejection does not grant that allowance. These decisions survive worker restarts within the browser session. At most 32 provider handlers/transports are active at each boundary. Chrome necessarily decodes messages before these checks, so these are wallet admission bounds, not a general browser traffic guarantee.
+
+Chrome112 is required for the 10 MB session-storage quota. JSON size is not Chrome's exact memory accounting; native quota/storage failures remain errors and never authorize signing. Expired requests are pruned on queue access and the worker alarm. Old unversioned queue entries require a fresh request after an extension update. Queue deadlines, claim ownership and key/publication checks fail closed; the wallet's other session and document-lifetime policies still apply independently.

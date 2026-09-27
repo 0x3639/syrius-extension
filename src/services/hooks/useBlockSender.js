@@ -1,7 +1,9 @@
-import { useCallback, useState } from 'react';
-import { Enums, Zenon } from 'znn-ts-sdk';
+import { useCallback, useRef, useState } from 'react';
+import { Enums, Zenon, utils as sdkUtils } from 'znn-ts-sdk';
 
 import vault from '../wallet/vault';
+import requestSigningKey from '../wallet/requestSigningKey';
+import withApprovalDeadline from '../utils/approvalDeadline';
 import { invalidateAccountCache } from './useAccount';
 
 // Signing and broadcasting one account block, for the one caller that has to
@@ -26,16 +28,29 @@ import { invalidateAccountCache } from './useAccount';
 
 const useBlockSender = () => {
   const [isSending, setIsSending] = useState(false);
+  const generation = useRef(0);
   const [isGeneratingPlasma, setIsGeneratingPlasma] = useState(false);
 
-  const send = useCallback(async (template, { addressIndex } = {}) => {
+  const send = useCallback(async (template, { addressIndex, assertRequest, expiresAt } = {}) => {
+    const current = ++generation.current;
     const zenon = Zenon.getSingleton();
-    const keyPair = await vault.getSigningKeyPair(addressIndex);
+    await assertRequest?.();
+    const keyPair = requestSigningKey(await vault.getSigningKeyPair(addressIndex), assertRequest);
+    await assertRequest?.();
 
     setIsSending(true);
 
     try {
-      const signed = await zenon.send(template, keyPair, (status) => {
+      // Keep the shared SDK untouched. This operation checks expiry again at
+      // the final publication boundary, after all SDK preparation and signing.
+      const context = Object.create(zenon);
+      context.ledger = Object.create(zenon.ledger);
+      context.ledger.publishRawTransaction = async block => {
+        await assertRequest?.();
+        return zenon.ledger.publishRawTransaction(block);
+      };
+      const signed = await withApprovalDeadline(sdkUtils.BlockUtils.send(context, template, keyPair, (status) => {
+        if (generation.current !== current || (Number.isFinite(expiresAt) && expiresAt <= Date.now())) return;
         // `PowStatus.generating` is 0, so this has to compare rather than test
         // for truth — the obvious `if (status)` reads it as "done".
         if (status === Enums.PowStatus.generating) {
@@ -44,15 +59,18 @@ const useBlockSender = () => {
         if (status === Enums.PowStatus.done) {
           setIsGeneratingPlasma(false);
         }
-      });
+      }), expiresAt);
 
       // The balance on screen is now stale by definition.
       invalidateAccountCache();
+      await assertRequest?.();
       return signed;
     } finally {
       // In `finally`, so an error cannot leave the screen saying it is working.
-      setIsGeneratingPlasma(false);
-      setIsSending(false);
+      if (generation.current === current) {
+        setIsGeneratingPlasma(false);
+        setIsSending(false);
+      }
     }
   }, []);
 

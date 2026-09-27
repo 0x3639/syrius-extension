@@ -171,18 +171,22 @@ window.addEventListener(
 //
 // Background -> page
 //
-const receiveResponse = message => {
-  if (!message.error && Number.isFinite(message.expiresAt) && Date.now() >= message.expiresAt) {
+const receiveResponse = (message, reply = () => {}) => {
+  // Acceptance belongs to the isolated relay, before posting into the page's
+  // event queue. The native acknowledgement can reach the worker later.
+  const acceptedAt = Date.now();
+  if (!message.error && Number.isFinite(message.expiresAt) && acceptedAt >= message.expiresAt) {
     message = { ...message, result: undefined, error: { code: -32603,
       message: 'Approval expired. The outcome is unknown; verify it before retrying.' } };
   }
+  const acknowledge = () => reply({ accepted: !message.error, acceptedAt });
   const waiter = valueWaiters.get(message.id);
 
   if (waiter) {
     valueWaiters.delete(message.id);
     clearTimeout(waiter.timer);
     waiter.resolve(message.error ? null : message.result);
-    return false;
+    acknowledge(); return false;
   }
 
   const pendingLegacy = legacyInFlight.get(message.id);
@@ -192,10 +196,10 @@ const receiveResponse = message => {
     clearTimeout(timer);
     legacyInFlight.delete(message.id);
     const payload = message.error ? legacy.onError(message.error) : legacy.onSuccess(message.result);
-    decorateLegacyGrant(payload).then(value => postToPage(
-      !message.error && Number.isFinite(message.expiresAt) && Date.now() >= message.expiresAt
-        ? legacy.onError({ code: -32603, message: 'Approval expired. Verify the outcome before retrying.' }) : value));
-    return false;
+    decorateLegacyGrant(payload).then(postToPage);
+    // Decoration reads may wait on the permission lock; acknowledge now so
+    // they cannot deadlock the pending grant's durable promotion.
+    acknowledge(); return false;
   }
 
   postToPage({
@@ -205,16 +209,17 @@ const receiveResponse = message => {
     result: message.result,
     error: message.error,
     expiresAt: message.expiresAt,
+    acceptedAt,
   });
-  return false;
+  acknowledge(); return false;
 };
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (!message || message.channel !== 'znn') {
     return false;
   }
 
-  if (message.kind === 'response') return receiveResponse(message);
+  if (message.kind === 'response') return receiveResponse(message, reply);
 
   if (message.kind === 'event') {
     postToPage({ target: inpageTarget, kind: 'event', event: message.event, data: message.data });

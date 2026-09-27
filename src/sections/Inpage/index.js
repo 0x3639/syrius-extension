@@ -90,7 +90,7 @@
       if (waiting.timer) {
         clearTimeout(waiting.timer);
       }
-      if (!message.error && Number.isFinite(message.expiresAt) && Date.now() >= message.expiresAt) {
+      if (!message.error && Number.isFinite(message.expiresAt) && (!Number.isFinite(message.acceptedAt) || message.acceptedAt >= message.expiresAt)) {
         waiting.reject({ code: -32603, message: 'Approval expired. Verify the outcome before retrying.' });
       } else if (message.error) {
         waiting.reject(message.error);

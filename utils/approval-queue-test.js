@@ -84,7 +84,13 @@ const fixture = (requiredDifficulty = 0) => {
       create: async () => { if (faults.windowCreate) throw Error('window creation unavailable'); if (faults.afterCreateWrite) faults.sessionWrite = true; const id = 100 + ++counts.created; windows.set(id, {}); return { id }; },
       remove: async id => { windows.delete(id); },
     },
-    tabs: { onRemoved: event('closedTab'), sendMessage: async (tabId, value, options) => { delivered.push({ tabId, value: clone(value), options: clone(options) }); } },
+    tabs: { onRemoved: event('closedTab'), sendMessage: async (tabId, value, options) => {
+      await pause('delivery');
+      const accepted = !value.error && (!Number.isFinite(value.expiresAt) || now < value.expiresAt);
+      const received = !accepted && !value.error ? { ...value, result: undefined, error: { code: -32603, message: 'Approval expired.' } } : value;
+      delivered.push({ tabId, value: clone(received), options: clone(options) });
+      const receipt = { accepted, acceptedAt: now }; await pause('acknowledgement'); return receipt;
+    } },
     alarms: { onAlarm: event('alarm'), create() {} },
   };
   class PowWorker {
@@ -283,7 +289,7 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
   }
   // Finalization checks cover the actual awaited attention, permission read,
   // durable grant and activation writes. A late attempt restores prior consent.
-  for (const phase of ['attention', 'read', 'grant', 'activation']) {
+  for (const phase of ['attention', 'read', 'grant', 'delivery']) {
     for (const previous of [null, { origin: 'https://fixture.invalid', title: 'Earlier consent', connectedAt: 1, lastUsedAt: 2 }]) {
       const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
       if (previous) f.local[permission.storageKey] = { [previous.origin]: previous };
@@ -291,16 +297,18 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
       const owner = await f.queue.claim(f.identity.identityOf(row), 10);
       const held = phase === 'attention' ? f.holdStorage('session', f.queue.attentionKey)
         : phase === 'read' ? f.hold('localRead') : phase === 'grant' ? f.holdStorage('local')
-          : f.holdStorage('session', 'syrius.permissionApprovals', 2);
+          : f.hold('delivery');
       const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
       await held.started.promise; f.advance(limits.ttl); held.release.resolve();
-      assert.equal(await result, false); assert.equal(f.delivered.length, 1);
+      assert.equal(await result, false); assert(f.delivered.length >= 1);
+      assert(f.delivered.every(delivery => delivery.value.result === undefined));
       assert.equal(f.delivered[0].value.result, undefined); assert.equal(f.delivered[0].value.error.code, -32603);
       assert.deepEqual(await permission.get(row.origin), previous);
       assert.deepEqual(f.local[permission.storageKey]?.[row.origin] || null, previous);
     }
   }
-  // A failed local rollback retains an inactive, persisted guard across realms.
+  // A failed local rollback retains a durably inactive row even after the
+  // entire browser session disappears, with prior consent preserved.
   for (const previous of [null, { origin: 'https://fixture.invalid', title: 'Retained consent', connectedAt: 1 }]) {
     const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
     if (previous) f.local[permission.storageKey] = { [previous.origin]: previous };
@@ -309,9 +317,38 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
     await held.started.promise; f.advance(limits.ttl); f.faults.localWrite = true; held.release.resolve();
     assert.equal(await result, false); assert.deepEqual(await permission.get(row.origin), previous);
+    for (const key of Object.keys(f.session)) delete f.session[key];
     const fresh = loader({ chrome: f.chrome, navigator: { locks: { request: async (name, fn) => fn() } } })('src/sections/Background/permissions.js').default;
     assert.deepEqual(await fresh.get(row.origin), previous);
     f.faults.localWrite = false; await permission.revoke(row.origin); assert.equal(await fresh.isConnected(row.origin), false);
+  }
+  // Native acknowledgement and durable promotion can finish later than relay
+  // acceptance. The fixed deadline applies to that exact acceptance point.
+  for (const phase of ['acknowledgement', 'promotion']) {
+    const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
+    const row = await f.add(entry('accepted-before-expiry', 'doc-a', 'connect'));
+    const owner = await f.queue.claim(f.identity.identityOf(row), 10);
+    const held = phase === 'promotion' ? f.holdStorage('local', permission.storageKey, 2) : f.hold('acknowledgement');
+    const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
+    await held.started.promise; assert.equal(f.delivered.length, 1); assert.equal(f.delivered[0].value.error, undefined);
+    f.advance(limits.ttl); held.release.resolve(); assert.equal(await result, true);
+    assert.equal(await permission.isConnected(row.origin), true);
+    assert((await permission.get(row.origin)).approvalAcceptedAt < row.expiresAt);
+    for (const key of Object.keys(f.session)) delete f.session[key];
+    const fresh = loader({ chrome: f.chrome, navigator: { locks: { request: async (name, fn) => fn() } } })('src/sections/Background/permissions.js').default;
+    assert.equal(await fresh.isConnected(row.origin), true);
+  }
+  // A failed promotion and failed rollback cannot turn a prepared record into
+  // authority when the browser loses all session-only state.
+  {
+    const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
+    const row = await f.add(entry('failed-promotion', 'doc-a', 'connect'));
+    const owner = await f.queue.claim(f.identity.identityOf(row), 10), held = f.holdStorage('local', permission.storageKey, 2);
+    const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
+    await held.started.promise; f.faults.localWrite = true; held.release.resolve(); assert.equal(await result, false);
+    for (const key of Object.keys(f.session)) delete f.session[key];
+    const fresh = loader({ chrome: f.chrome, navigator: { locks: { request: async (name, fn) => fn() } } })('src/sections/Background/permissions.js').default;
+    assert.equal(await fresh.isConnected(row.origin), false);
   }
   // Work is bounded synchronously even while the first storage read is held.
   {
@@ -410,6 +447,30 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     assert.equal(timers.size, limits.activeHandlers); assert.equal(posted.at(-1).method, 'znn.deniedWalletRead');
     timers.clear();
   }
+  // Legacy decoration waits for permission-gated reads, but acceptance is
+  // acknowledged synchronously before those reads can finish or the deadline
+  // advances. This prevents a grant/decoration wait cycle.
+  {
+    let now = 1000, receipt;
+    class Clock extends Date { static now() { return now; } }
+    const callbacks = [], posted = [], handlers = {};
+    const window = { location: { origin: 'https://fixture.invalid' }, postMessage: value => posted.push(value),
+      addEventListener: (name, fn) => { handlers[name] = fn; } };
+    const chrome = { runtime: { sendMessage: (value, callback) => { if (value.kind === 'request') callbacks.push({ value, callback }); else callback({}); },
+      onMessage: { addListener: fn => { handlers.background = fn; } } } };
+    loader({ window, chrome, Date: Clock })('src/sections/Content/index.js');
+    handlers.message({ source: window, data: { method: 'znn.requestWalletAccess' } });
+    const connection = callbacks.shift(); connection.callback({ accepted: true });
+    handlers.background({ channel: 'znn', kind: 'response', id: connection.value.id, result: [address.toString()], expiresAt: 1001 }, {}, value => { receipt = value; });
+    assert.deepEqual(receipt, { accepted: true, acceptedAt: 1000 }); assert.equal(posted.length, 0);
+    now = 1002;
+    for (const metadata of callbacks.splice(0)) {
+      metadata.callback({ accepted: true });
+      handlers.background({ channel: 'znn', kind: 'response', id: metadata.value.id, result: metadata.value.method === 'znn_chainId' ? 1 : 'wss://fixture.invalid' });
+    }
+    await flush(); assert.equal(posted.at(-1).method, 'znn.grantedWalletRead');
+    assert.equal(posted.at(-1).data.chainId, 1);
+  }
   // The MAIN-world receiver independently rejects a transport-delayed result.
   {
     const handlers = {}, posted = [];
@@ -419,6 +480,18 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     const response = window.zenon.connect().then(value => ({ value }), error => ({ error }));
     handlers.message({ source: window, data: { target: 'znn-inpage', kind: 'response', id: posted[0].id, result: [address.toString()], expiresAt: Date.now() - 1 } });
     assert.equal((await response).error.code, -32603); assert.deepEqual(window.zenon.accounts, []);
+  }
+  // A receipt accepted by the relay before expiry remains a completed result
+  // when the page's own event queue runs later.
+  {
+    const handlers = {}, posted = [];
+    const window = { location: { origin: 'https://fixture.invalid' }, dispatchEvent() {},
+      addEventListener: (name, fn) => { handlers[name] = fn; }, postMessage: value => posted.push(value) };
+    loader({ window })('src/sections/Inpage/index.js');
+    const response = window.zenon.connect();
+    handlers.message({ source: window, data: { target: 'znn-inpage', kind: 'response', id: posted[0].id,
+      result: [address.toString()], acceptedAt: Date.now() - 20, expiresAt: Date.now() - 10 } });
+    assert.deepEqual(await response, [address.toString()]);
   }
   console.log('approval queue: bounded JSON/capacity/transient work; storage/window failures; persistent attention; absolute expiry including delayed finalization and failed rollback; actual worker/relay/UI/SDK legitimate and delayed controls passed');
 })().catch(error => { console.error(error.stack || String(error)); process.exitCode = 1; }).finally(() => clearTimeout(watchdog));

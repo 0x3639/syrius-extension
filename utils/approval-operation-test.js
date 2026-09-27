@@ -60,6 +60,18 @@ let server, native;
     operation.context(zenon).ledger.getFrontierBlock({ toString: () => 'deadline' })), /expired|canceled|timeout/i);
   await until(() => keyCount() === 0);
   assert.equal(received.length, 4);
+  // Cross the deadline between the awaited assertion and the native-call
+  // boundary. Exercise the corrected RPC wrapper; no vulnerable code is run.
+  for (const remaining of [-1, 0, 1]) {
+    let clockReads = 0, calls = 0, timeout;
+    class Clock extends Date { static now() { return ++clockReads < 6 ? 0 : 100 - remaining; } }
+    const boundary = load('src/services/wallet/approvalOperation.js', { Date: Clock }).runApprovalOperation;
+    const client = { _wsRpc2Client: { call: (method, params, ms) => { calls++; timeout = ms; return Promise.resolve(null); } } };
+    const api = { ledger: { client }, embedded: { plasma: { client } } };
+    const result = boundary(100, operation => operation.context(api).ledger.client.sendRequest('ledger.publishRawTransaction', []));
+    if (remaining <= 0) { await assert.rejects(result, /expired|canceled/); assert.equal(calls, 0); }
+    else { assert.equal(await result, null); assert.equal(calls, 1); assert.equal(timeout, 1); }
+  }
   const workers = [];
   class WorkerFixture {
     constructor(url) { this.url = url; this.terminated = 0; workers.push(this); }

@@ -97,7 +97,7 @@ const sendToTab = async (tabId, message, frameId, documentId) => {
   try {
     let timer;
     try {
-      await Promise.race([
+      return await Promise.race([
         chrome.tabs.sendMessage(tabId, message, { ...(frameId === undefined ? {} : { frameId }), ...(documentId ? { documentId } : {}) }),
         new Promise(resolve => { timer = setTimeout(resolve, 5000); }),
       ]);
@@ -296,7 +296,7 @@ const internalMethods = {
       if (Date.now() >= request.expiresAt) throw new Error('Approval expired during finalization.');
     };
     let delivery;
-    const complete = () => { checkDeadline(); delivery = respond(request, request.responseId, result); };
+    const complete = () => { checkDeadline(); delivery = respond(request, request.responseId, result); return delivery; };
     try {
       checkDeadline();
       // Save this optional convenience before permission activation. A held
@@ -306,7 +306,7 @@ const internalMethods = {
       checkDeadline();
       if (request.type === 'connect') {
         if (!(await permissions.grant(request.origin, { title: request.title, favicon: request.favicon },
-          { expiresAt: request.expiresAt, complete }))) throw new Error('The connection permission could not be saved.');
+          { expiresAt: request.expiresAt, confirm: complete }))) throw new Error('The connection permission could not be saved.');
       } else complete();
       await delivery;
       return true;

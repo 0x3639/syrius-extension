@@ -36,7 +36,11 @@ const runApprovalOperation = async (expiresAt, execute, { signal, assertRequest 
     // installs a native queue-cleanup timeout. Do not invoke the SDK's unbounded
     // sendRequest wrapper or mutate the client shared by other wallet screens.
     if (!client || typeof client.call !== 'function') throw new Error('The wallet node is not connected.');
-    const timeout = Math.max(1, Math.min(rpcTimeoutMs, expiresAt - Date.now()));
+    const remaining = expiresAt - Date.now();
+    // The awaited assertion and native call are separate continuations. Never
+    // turn an already-expired authorization into a new one-millisecond RPC.
+    if (controller.signal.aborted || remaining <= 0) throw ended();
+    const timeout = Math.min(rpcTimeoutMs, remaining);
     const result = await wait(track(Promise.resolve(client.call(method, params, timeout))));
     check(); return result;
   };

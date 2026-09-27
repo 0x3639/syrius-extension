@@ -18,20 +18,24 @@ const compile = file => babel.transformFileSync(path.join(root, file), {
   presets: [['@babel/preset-env', { targets: { chrome: '111' }, modules: 'commonjs' }]], configFile: false, babelrc: false,
 }).code;
 const files = ['src/sections/Background/index.js', 'src/sections/Background/requests.js',
-  'src/sections/Background/frames.js', 'src/sections/Background/permissions.js', 'src/services/utils/documentBinding.js'];
-write('worker.js', `// Fixture-only storage scheduler; the imported application modules are unchanged.
+  'src/sections/Background/frames.js', 'src/sections/Background/permissions.js', 'src/services/utils/documentBinding.js', 'src/services/utils/nativeNavigation.js'];
+const scheduler = `// Fixture-only storage scheduler; the imported application modules are unchanged.
 let permissionGate; const nativeSet=chrome.storage.local.set.bind(chrome.storage.local);
 chrome.storage.local.set=async values=>{if(permissionGate&&values['syrius.permissions']&&Object.values(values['syrius.permissions']).some(entry=>entry.pendingApproval)){
 const gate=permissionGate;gate.entered=true;await gate.wait;permissionGate=null;}return nativeSet(values);};
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{if(message.channel!=='fixture'||sender.url!==chrome.runtime.getURL('control.html'))return false;
 if(message.method==='hold'){let release;const wait=new Promise(resolve=>{release=resolve;});permissionGate={wait,release,entered:false};reply(true);}
 if(message.method==='entered')reply(Boolean(permissionGate?.entered));if(message.method==='release'){permissionGate?.release();reply(true);}return false;});
-const factories={${files.map(file => `${JSON.stringify(file)}:(module,exports,require)=>{${compile(file)}\n}`).join(',')}};
+`;
+const bundle = (sources, entry = sources[0]) => `(()=>{const factories={${sources.map(file => `${JSON.stringify(file)}:(module,exports,require)=>{${compile(file)}\n}`).join(',')}};
 const cache={}; const load=name=>{if(cache[name])return cache[name].exports;const module=cache[name]={exports:{}};
-factories[name](module,module.exports,id=>{let p=new URL(id,'https://bundle/'+name).pathname.slice(1);if(!p.endsWith('.js'))p+='.js';return load(p);});return module.exports;};load('src/sections/Background/index.js');`);
-for (const [name, file] of [['content.js', 'Content'], ['inpage.js', 'Inpage']]) write(name, fs.readFileSync(path.join(root, `src/sections/${file}/index.js`), 'utf8'));
+factories[name](module,module.exports,id=>{let p=new URL(id,'https://bundle/'+name).pathname.slice(1);if(!p.endsWith('.js'))p+='.js';return load(p);});return module.exports;};load(${JSON.stringify(entry)});})();`;
+write('worker.js', scheduler + bundle(files));
+for (const [name, section] of [['content.js', 'Content'], ['inpage.js', 'Inpage']]) write(name, bundle([
+  `src/sections/${section}/index.js`, 'src/services/utils/documentLifetime.js',
+]));
 write('manifest.json', JSON.stringify({ manifest_version: 3, name: 'Syrius document lifecycle regression', version: '1.0', minimum_chrome_version: '111',
-  permissions: ['storage', 'alarms'], background: { service_worker: 'worker.js' },
+  permissions: ['storage', 'alarms', 'webNavigation'], background: { service_worker: 'worker.js' },
   content_scripts: ['MAIN', 'ISOLATED'].map(world => ({ matches: ['http://*.test/*'], js: [world === 'MAIN' ? 'inpage.js' : 'content.js'], world, all_frames: true, run_at: 'document_start' })) }));
 write('control.html', '<!doctype html><script src="control.js"></script>');
 write('popup.html', '<!doctype html><title>Inert approval window</title><p>Lifecycle fixture: no signing UI.</p>');
@@ -44,7 +48,7 @@ const watchdog = setTimeout(() => { console.error('Native document fixture timed
 (async () => {
   server = http.createServer((request, response) => {
     response.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'max-age=300' });
-    response.end('<!doctype html><title>Inert lifecycle page</title><p>Local regression fixture</p><script>window.shows=[];addEventListener("pageshow",e=>shows.push(e.persisted));</script>' + (request.url === '/frames' ? '<iframe id="child" src="/child-a"></iframe>' : ''));
+    response.end('<!doctype html><title>Inert lifecycle page</title><p>Local regression fixture</p><script>window.shows=[];addEventListener("pageshow",e=>shows.push(e.persisted),true);for(const type of ["pagehide","pageshow"])addEventListener(type,e=>e.stopImmediatePropagation(),true);</script>' + (request.url === '/frames' ? '<iframe id="child" src="/child-a"></iframe>' : ''));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port, aOrigin = `http://a.test:${port}`, bOrigin = `http://b.test:${port}`;
@@ -129,6 +133,60 @@ const watchdog = setTimeout(() => { console.error('Native document fixture timed
   assert.equal(await resolve(child), false);
   await begin(page, "document.querySelector('iframe').contentWindow"); const childFresh = await waitRequest(first.tabId);
   assert.equal(childFresh.frameId, child.frameId); assert.notEqual(childFresh.documentId, child.documentId); assert.equal(await resolve(childFresh), true);
+  // The same rewrite boundary applies inside a native subframe.
+  await begin(page, "document.querySelector('iframe').contentWindow"); const childRewrite = await waitRequest(first.tabId);
+  await evaluate(page, "(()=>{const d=document.querySelector('iframe').contentDocument;d.open();d.write('<!doctype html><p>Inert rewritten child</p>');d.close();return true;})()");
+  await eventually(() => evaluate(page, "document.querySelector('iframe').contentWindow.outcomes"), value => value.length === 1, 'child rewrite cancellation');
+  assert.deepEqual(await evaluate(page, "document.querySelector('iframe').contentWindow.outcomes"), [{ error: 4900 }]);
+  assert.equal(await resolve(childRewrite), false);
+  await begin(page, "document.querySelector('iframe').contentWindow"); const childAfterRewrite = await waitRequest(first.tabId);
+  assert.equal(childAfterRewrite.documentId, childRewrite.documentId); assert.notEqual(childAfterRewrite.activation, childRewrite.activation);
+  assert.equal(await resolve(childAfterRewrite), true);
+  // A real in-place rewrite keeps the native document identity but starts a
+  // new relay activation, restores erased handlers, and requires fresh consent.
+  for (const rewrite of [
+    "document.open();document.write('<!doctype html><title>Rewritten inert page</title><p>Fresh local DOM</p>');document.close();",
+    "const root=document.documentElement;document.open();document.appendChild(root);document.close();",
+  ]) {
+    await begin(page); const beforeRewrite = await waitRequest(first.tabId);
+    await evaluate(page, `(()=>{${rewrite}return true;})()`);
+    await eventually(() => evaluate(page, 'outcomes'), value => value.length === 1, 'rewritten request cancellation');
+    assert.deepEqual(await evaluate(page, 'outcomes'), [{ error: 4900 }]);
+    assert.equal(await resolve(beforeRewrite), false);
+    await begin(page); const afterRewrite = await waitRequest(first.tabId);
+    assert.equal(afterRewrite.documentId, beforeRewrite.documentId); assert.notEqual(afterRewrite.activation, beforeRewrite.activation);
+    assert.equal(await resolve(afterRewrite), true);
+    await eventually(() => evaluate(page, 'outcomes'), value => value.length === 1, 'rewritten provider completion');
+  }
+  // Reopening an already empty document must not reactivate old requests or
+  // strand the provider when a new root is eventually written.
+  await begin(page); const beforeEmpty = await waitRequest(first.tabId);
+  await evaluate(page, "(document.open(),true)");
+  await eventually(() => evaluate(page, 'outcomes'), value => value.length === 1, 'empty document cancellation');
+  assert.deepEqual(await evaluate(page, 'outcomes'), [{ error: 4900 }]);
+  await evaluate(page, "(document.open(),true)");
+  assert.equal(await evaluate(page, "zenon.connect().then(()=>false,error=>error.code===4900)"), true);
+  await evaluate(page, "(document.write('<!doctype html><title>Fresh empty-document recovery</title><p>Inert</p>'),document.close(),true)");
+  assert.equal(await resolve(beforeEmpty), false);
+  await begin(page); const afterEmpty = await waitRequest(first.tabId); assert.equal(await resolve(afterEmpty), true);
+  // Ordinary body edits preserve the current approval.
+  await begin(page); const beforeBody = await waitRequest(first.tabId);
+  await evaluate(page, "(document.body.textContent='Ordinary local body update',true)");
+  assert.equal(await internal('approvals.current', { binding: beforeBody }), true); assert.equal(await resolve(beforeBody), true);
+  // Chrome's navigation fence also works when a rewritten local page owns its
+  // lifecycle listeners. No approval should survive the real history round trip.
+  await evaluate(page, "(()=>{document.open();document.write('<!doctype html><p>Inert lifecycle recovery</p>');document.close();window.nativeShows=[];addEventListener('pageshow',e=>nativeShows.push(e.persisted),true);for(const type of ['pagehide','pageshow'])addEventListener(type,e=>e.stopImmediatePropagation(),true);return true;})()");
+  await begin(page); const nativeOld = await waitRequest(first.tabId);
+  const nativeUrl = await evaluate(page, 'location.href');
+  await cdp('Page.navigate', { url: aOrigin + '/native-fence-away' }, page.sessionId); await ready(page, aOrigin + '/native-fence-away');
+  await evaluate(page, 'history.back()'); await ready(page, nativeUrl);
+  assert.equal(await evaluate(page, 'nativeShows.at(-1)'), true);
+  assert.equal(await resolve(nativeOld), false);
+  assert.deepEqual(await internal('permissions.list'), []);
+  await begin(page); const nativeFresh = await waitRequest(first.tabId);
+  assert.equal(nativeFresh.documentId, nativeOld.documentId);
+  assert.notEqual(nativeFresh.navigationTab, nativeOld.navigationTab);
+  assert.equal(await resolve(nativeFresh), true);
   // Two ordinary legacy tabs remain independently queued and resolvable.
   const second = await open(aOrigin + '/legacy'); await ready(second, aOrigin + '/legacy');
   for (const current of [page, second]) await evaluate(current, "(window.legacy=[],addEventListener('message',e=>{if(e.data?.method==='znn.grantedWalletRead')legacy.push(e.data.data);}),postMessage({method:'znn.requestWalletAccess'},location.origin),true)");
@@ -158,7 +216,7 @@ const watchdog = setTimeout(() => { console.error('Native document fixture timed
   await begin(second); const closing = await waitRequest();
   await cdp('Target.closeTarget', { targetId: second.targetId });
   await eventually(() => evaluate(control, "records('znn.pendingRequests')"), value => !Object.values(value || {}).some(r => r.tabId === closing.tabId), 'tab close cleanup');
-  const result = { browser: version.Browser, actualModules: files.concat(['Content/index.js', 'Inpage/index.js']), nonSecureHttp: true, sameOriginNavigation: true,
+  const result = { browser: version.Browser, actualModules: files.concat(['src/sections/Content/index.js', 'src/sections/Inpage/index.js', 'src/services/utils/documentLifetime.js']), nonSecureHttp: true, lifecycleCaptureOrdering: true, nativeNavigationFence: true, documentRewriteRecovery: true, subframeRewriteRecovery: true, emptyRewriteRecovery: true, ordinaryBodyEdits: true, sameOriginNavigation: true,
     crossOriginNavigation: true, nativeSubframeNavigation: true, bfcacheRestored: restored, oldApprovalsCancelled: true, freshRequestsAndEvents: true, independentLegacyTabs: true, provisionalGrantCancellation: true, completedConsentSurvivesNavigation: true, tabCloseCleanup: true };
   fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify({ ...result, artifact: path.join(dir, 'result.json') }));

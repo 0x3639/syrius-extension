@@ -3,16 +3,9 @@ import { isLive, sameDocument } from '../../services/utils/documentBinding';
 // Which frames currently have this wallet injected, and what origin each one
 // is.
 //
-// Events like "the selected address changed" have to reach every connected
-// page. The obvious way to find them is `chrome.tabs.query({})` and filter by
-// `tab.url` — but reading a tab's URL requires either the `tabs` permission or
-// host permissions, and `tabs` is the one Chrome describes to the user, on the
-// install prompt, as "Read your browsing history". A wallet does not need that.
-//
-// So the frames announce themselves instead. Each content script says hello as
-// it loads, and Chrome tells us its tab, its frame and its origin as part of
-// delivering that message — all facts about the sender, none of them something
-// a page can claim for itself.
+// Frames announce their presence with browser-provided sender identity. The
+// separate webNavigation generation invalidates these records across navigation;
+// no browsing URLs or history are persisted by that listener.
 
 const storageKey = 'znn.frames';
 

@@ -208,6 +208,7 @@ const requests = {
   listCurrent,
   current,
   cancelDocument,
+  removeWhere,
   cancelTab,
   oldest,
   get,

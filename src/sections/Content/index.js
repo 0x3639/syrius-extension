@@ -1,3 +1,5 @@
+import observeDocumentLifetime from '../../services/utils/documentLifetime';
+
 // The isolated relay owns activation and request tokens. Page messages supply
 // only correlation, method and parameters; they cannot select these bindings.
 const inpageTarget = 'znn-inpage';
@@ -12,7 +14,7 @@ const privateToken = () => {
   const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
-let active = true;
+let active = Boolean(document.documentElement);
 let activation = privateToken();
 let legacyCounter = 0;
 const outstanding = new Map();
@@ -49,6 +51,7 @@ const sendToBackground = (message, requestToken) => {
   }
 };
 const begin = (entry) => {
+  lifetime.check();
   if (!active || (entry.activation && entry.activation !== activation)) {
     entry.resolve?.(null);
     return;
@@ -86,7 +89,8 @@ const settle = (requestToken, message) => {
   return true;
 };
 
-window.addEventListener('message', event => {
+const receivePageMessage = event => {
+  lifetime.check();
   if (!active || event.source !== window || !event.data || typeof event.data !== 'object') return;
   const message = event.data;
   if (message.target === contentTarget && message.kind === 'request') {
@@ -98,9 +102,10 @@ window.addEventListener('message', event => {
     legacyCounter += 1;
     begin({ kind: 'legacy', id: `znn-legacy-${privateToken()}`, legacy, method: legacy.method, params: message.params || {} });
   }
-});
+};
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  lifetime.check();
   if (sender.id !== chrome.runtime.id || !message || message.channel !== 'znn') return false;
   const current = active && message.activation === activation;
   let accepted = false;
@@ -125,7 +130,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-window.addEventListener('pagehide', () => {
+const leave = () => {
   const departed = activation;
   active = false;
   for (const entry of outstanding.values()) {
@@ -134,10 +139,17 @@ window.addEventListener('pagehide', () => {
   }
   outstanding.clear();
   sendToBackground({ channel: 'znn', kind: 'bye', activation: departed });
-});
-window.addEventListener('pageshow', event => {
+};
+const enter = event => {
+  if (!document.documentElement) return;
   if (event.persisted || !active) activation = privateToken();
   active = true;
   sendToBackground({ channel: 'znn', kind: 'hello', activation });
+};
+const listen = window.addEventListener.bind(window);
+const lifetime = observeDocumentLifetime({
+  onHide: leave, onShow: enter,
+  onReset: () => { leave(); enter({ persisted: true }); },
+  install: () => listen('message', receivePageMessage),
 });
 sendToBackground({ channel: 'znn', kind: 'hello', activation });

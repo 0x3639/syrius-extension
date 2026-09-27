@@ -62,7 +62,11 @@ const fixture = () => {
     };
   }
   const runtime = { id: 'document-test', getURL: value => 'chrome-extension://document-test/' + value };
-  const chrome = { storage, runtime: { ...runtime, onMessage: { addListener: fn => { chrome.listener = fn; } }, onInstalled: { addListener() {} }, onStartup: { addListener() {} } },
+  const chrome = { storage, webNavigation: {
+    onBeforeNavigate: { addListener: fn => { chrome.beforeNavigate = fn; } },
+    getFrame: async ({ tabId, frameId }) => { const doc = documents.findLast(d => d.tabId === tabId && d.frameId === frameId && d.routable);
+      return doc && { documentId: doc.documentId, documentLifecycle: 'active' }; },
+  }, runtime: { ...runtime, onMessage: { addListener: fn => { chrome.listener = fn; } }, onInstalled: { addListener() {} }, onStartup: { addListener() {} } },
     tabs: { onRemoved: { addListener: fn => { chrome.closeTab = fn; } }, sendMessage: async (tabId, message, options) => {
       deliveries.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
       assert(Number.isInteger(options.frameId)); assert.equal(typeof options.documentId, 'string');
@@ -93,10 +97,16 @@ const fixture = () => {
   const internal = (method, params = {}) => new Promise((resolve, reject) => worker.listener({ channel: 'internal', method, params },
     { id: runtime.id, url: runtime.getURL('popup.html') }, response => response.error ? reject(Error(response.error)) : resolve(response.result)));
   const page = ({ tabId = 1, frameId = 0, origin = 'https://site.invalid', documentId = uuid().replaceAll('-', '').toUpperCase(), missingIdentity = false } = {}) => {
-    const handlers = new Map(), posted = [];
+    const handlers = new Map(), posted = [], observers = [];
+    const document = { documentElement: { nodeType: 1 } };
+    class MutationObserver {
+      constructor(callback) { this.callback = callback; this.records = []; observers.push(this); }
+      observe() {}
+      takeRecords() { const records = this.records; this.records = []; return records; }
+    }
     const window = { location: { origin }, postMessage: message => {
       posted.push(structuredClone(message)); queueMicrotask(() => emit('message', { source: window, data: structuredClone(message) }));
-    }, addEventListener: (name, fn) => { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); }, dispatchEvent: event => emit(event.type, event) };
+    }, addEventListener: (name, fn) => { if (!handlers.has(name)) handlers.set(name, []); if (!handlers.get(name).includes(fn)) handlers.get(name).push(fn); }, dispatchEvent: event => emit(event.type, event) };
     const emit = (name, event = {}) => (handlers.get(name) || []).forEach(fn => fn({ type: name, ...event }));
     const sender = { id: runtime.id, tab: { id: tabId, title: 'Synthetic page' }, frameId, url: origin + '/fixture', origin, ...(missingIdentity ? {} : { documentId }) };
     const doc = { tabId, frameId, documentId, routable: true, posted, emit, window, sender };
@@ -106,9 +116,16 @@ const fixture = () => {
       if (doc.transportFailure) { docChrome.runtime.lastError = { message: 'Synthetic disconnected transport' }; callback(); delete docChrome.runtime.lastError; return; }
       worker.listener(structuredClone(message), sender, callback);
     } } };
-    const env = { window, chrome: docChrome, crypto: { getRandomValues: array => crypto.getRandomValues(array) }, setTimeout: setTimer, clearTimeout: clearTimer, Event };
+    const env = { window, document, MutationObserver, chrome: docChrome, crypto: { getRandomValues: array => crypto.getRandomValues(array) }, setTimeout: setTimer, clearTimeout: clearTimer, Event };
     documents.push(doc);
-    for (const file of ['src/sections/Inpage/index.js', 'src/sections/Content/index.js']) new Function(...Object.keys(env), fs.readFileSync(path.join(root, file), 'utf8'))(...Object.values(env));
+    const loadPage = loader(env);
+    for (const file of ['src/sections/Inpage/index.js', 'src/sections/Content/index.js']) loadPage(file);
+    doc.rewrite = (reinsert = false) => {
+      const old = document.documentElement; handlers.clear();
+      if (!reinsert) document.documentElement = { nodeType: 1 };
+      for (const observer of observers) observer.records.push({ target: document, removedNodes: [old] });
+      queueMicrotask(() => { for (const observer of observers) { const records = observer.takeRecords(); if (records.length) observer.callback(records); } });
+    };
     doc.hide = () => emit('pagehide', { persisted: true });
     doc.show = () => emit('pageshow', { persisted: true });
     return doc;
@@ -257,6 +274,59 @@ const watchdog = setTimeout(() => { console.error('Document regression fixture t
     f.chrome.storage.session.set = async values => { if (pendingKey in values) throw Error('Synthetic quota failure'); return original(values); };
     await assert.rejects(a.window.zenon.connect(), error => error.code === -32603);
     assert.equal(f.windowCount, 0); assert.deepEqual(f.session[pendingKey] || {}, {});
+  }
+  // Browser navigation invalidates approvals even without any DOM notification,
+  // and that cancellation survives worker restart. Sibling frames stay usable.
+  for (const frameId of [0, 3]) {
+    const f = fixture(), a = f.page({ frameId }), other = f.page({ frameId: 4 });
+    // Keep public correlation IDs distinct; global ID ownership is a separate branch.
+    await other.window.zenon.getAccounts();
+    a.window.zenon.connect().catch(() => {}); other.window.zenon.connect().catch(() => {}); await f.flush();
+    const pending = await f.internal('approvals.list');
+    const old = pending.find(r => r.frameId === frameId), sibling = pending.find(r => r.frameId === 4);
+    assert(old); assert(sibling);
+    f.chrome.beforeNavigate({ tabId: 1, frameId }); await f.flush(); f.restart();
+    assert.equal(await f.internal('approvals.current', { binding: old }), false);
+    assert.equal(await f.internal('approvals.resolve', { binding: old, result: ['synthetic-account'], grantOrigin: true }), false);
+    assert.deepEqual(await f.internal('permissions.list'), []);
+    assert.equal(await f.internal('approvals.current', { binding: sibling }), frameId !== 0);
+    const promise = a.window.zenon.connect(); await f.flush();
+    const fresh = (await f.internal('approvals.list')).find(r => r.frameId === frameId);
+    assert.notDeepEqual([fresh.navigationTab, fresh.navigationFrame], [old.navigationTab, old.navigationFrame]);
+    assert.equal(await f.internal('approvals.resolve', { binding: fresh, result: ['synthetic-account'] }), true);
+    assert.deepEqual(await promise, ['synthetic-account']);
+  }
+  // A failed generation write still cancels the affected queue. A restarted
+  // worker must not recover the pre-navigation approval from older storage.
+  {
+    const f = fixture(), a = f.page(); a.window.zenon.connect().catch(() => {}); await f.flush();
+    const old = await f.internal('approvals.next'), set = f.chrome.storage.session.set;
+    f.chrome.storage.session.set = async values => { if ('znn.navigation' in values) throw Error('Synthetic navigation write failure'); return set(values); };
+    f.chrome.beforeNavigate({ tabId: 1, frameId: 0 }); await f.flush();
+    assert.equal(await f.internal('approvals.current', { binding: old }), false);
+    f.restart(); assert.equal(await f.internal('approvals.current', { binding: old }), false);
+  }
+  // A native navigation also fences an in-flight provisional connection write.
+  {
+    const f = fixture(), a = f.page(); a.window.zenon.connect().catch(() => {}); await f.flush();
+    const old = await f.internal('approvals.next'), gate = f.holdPermissionWrite(() => true);
+    const result = f.internal('approvals.resolve', { binding: old, result: ['synthetic-account'], grantOrigin: true });
+    await gate.started.promise; f.chrome.beforeNavigate({ tabId: 1, frameId: 0 }); await f.flush();
+    gate.release.resolve(); assert.equal(await result, false); assert.deepEqual(await f.internal('permissions.list'), []);
+  }
+  // In-place document rewrites erase DOM listeners, but the private observer
+  // cancels old tokens and restores provider/relay handlers for fresh requests.
+  for (const reinsert of [false, true]) {
+    const f = fixture(), a = f.page();
+    const first = a.window.zenon.connect(); const denied = assert.rejects(first, error => error.code === 4900);
+    await f.flush(); const old = await f.internal('approvals.next');
+    a.rewrite(reinsert); await denied; await f.flush();
+    assert.equal(await f.internal('approvals.current', { binding: old }), false);
+    const second = a.window.zenon.connect(); await f.flush(); const fresh = await f.internal('approvals.next');
+    assert.equal(fresh.documentId, old.documentId); assert.notEqual(fresh.activation, old.activation);
+    await f.internal('approvals.resolve', { binding: fresh, result: ['synthetic-account'], grantOrigin: true });
+    assert.deepEqual(await second, ['synthetic-account']);
+    a.hide(); a.show(); await f.flush(); assert.deepEqual(await a.window.zenon.getAccounts(), []);
   }
   // A departure while persistence is pending cannot resurrect a queued entry.
   {

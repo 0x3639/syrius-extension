@@ -1,3 +1,4 @@
+import nativeNavigation from '../../services/utils/nativeNavigation';
 import frames from './frames';
 import permissions from './permissions';
 import requests from './requests';
@@ -221,9 +222,8 @@ const providerMethods = {
   },
 };
 
-const handleProviderRequest = async (request, sender) => {
+const handleProviderRequest = async (request, sender, target) => {
   const origin = permissions.originOf(sender);
-  const target = targetFrom(sender, request);
   const { id, method, params } = request;
 
   if (!origin) {
@@ -351,26 +351,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!isFromContentScript(sender)) return false;
     const target = targetFrom(sender, message);
     if (!target) { sendResponse({ accepted: false, error: errors.disconnected }); return false; }
-    const operation = message.kind === 'hello'
-      ? frames.register(target, permissions.originOf(sender))
-      : Promise.all([frames.forgetTarget(target), requests.cancelDocument(target)]);
-    Promise.resolve(operation).catch(() => {});
-    sendResponse({ accepted: true });
-    return false;
+    if (message.kind === 'bye') {
+      Promise.all([frames.forgetTarget(target), requests.cancelDocument(target)]).catch(() => {});
+      sendResponse({ accepted: true }); return false;
+    }
+    nativeNavigation.capture(target).then(bound => frames.register(bound, permissions.originOf(sender)))
+      .then(accepted => sendResponse({ accepted }), () => sendResponse({ accepted: false }));
+    return true;
   }
 
   if (message.channel === 'znn' && message.kind === 'request') {
     if (!isFromContentScript(sender)) return false;
     const target = targetFrom(sender, message);
-    if (!validRequest(target)) {
+    if (!target || typeof target.requestToken !== 'string') {
       sendResponse({ accepted: false, error: { code: 4900, message: 'The requesting document could not be identified. Reload the page.' } });
       return false;
     }
     // The callback acknowledges transport only. Human approval is answered
     // later to this exact native document and private relay request token.
-    handleProviderRequest(message, sender).catch(() => {});
-    sendResponse({ accepted: true });
-    return false;
+    nativeNavigation.capture(target).then(bound => {
+      if (!validRequest(bound)) throw requestEnded();
+      handleProviderRequest(message, sender, bound).catch(() => {});
+      sendResponse({ accepted: true });
+    }).catch(() => sendResponse({ accepted: false, error: { code: 4900, message: 'The requesting document has left. Make a new request.' } }));
+    return true;
   }
 
   if (message.channel === 'internal') {
@@ -425,9 +429,23 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   );
 });
 
+// Same-document history and fragment events deliberately do not invalidate.
+// An attempted cross-document navigation ends outstanding approvals even if
+// the navigation is later aborted. A fresh request can then be made.
+chrome.webNavigation.onBeforeNavigate.addListener(details => {
+  if (details.tabId < 0 || details.frameId < 0) return;
+  nativeNavigation.invalidate(details).then(stale =>
+    Promise.all([requests.removeWhere(stale), frames.forget(stale)])).catch(() => {
+    // If generation persistence fails, discard affected approvals as a second
+    // independent fence. The navigation helper also refuses use in this worker.
+    const affected = request => request.tabId === details.tabId && (details.frameId === 0 || request.frameId === details.frameId);
+    Promise.all([requests.removeWhere(affected), frames.forget(affected)]).catch(() => {});
+  });
+});
+
 // A closed tab has no frames left to deliver to.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  Promise.all([frames.forgetTab(tabId), requests.cancelTab(tabId)]).catch(() => {});
+  Promise.all([frames.forgetTab(tabId), requests.cancelTab(tabId), nativeNavigation.forgetTab(tabId)]).catch(() => {});
 });
 
 // The popup enforces the auto-lock whenever it opens, but the popup is usually

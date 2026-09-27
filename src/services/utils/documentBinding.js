@@ -1,3 +1,5 @@
+import nativeNavigation from './nativeNavigation';
+
 // Browser-authenticated document identity plus an isolated-relay activation.
 // Keep this shared transport module independent of the wallet and SDK.
 const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
@@ -10,19 +12,21 @@ const targetFrom = (sender, relay) => {
     documentId: sender?.documentId, activation: relay?.activation, requestToken: relay?.requestToken };
   return validTarget(target) ? target : null;
 };
-const validRequest = request => validTarget(request) && uuid(request.requestToken);
+const validRequest = request => validTarget(request) && uuid(request.requestToken) &&
+  typeof request.navigationTab === 'string' && typeof request.navigationFrame === 'string';
 const sameDocument = (a, b) => validTarget(a) && validTarget(b) &&
   ['tabId', 'frameId', 'documentId', 'activation'].every(field => a[field] === b[field]);
 const sameRequest = (a, b) => sameDocument(a, b) && validRequest(a) && validRequest(b) &&
-  a.id === b.id && a.requestToken === b.requestToken;
+  a.id === b.id && a.requestToken === b.requestToken &&
+  a.navigationTab === b.navigationTab && a.navigationFrame === b.navigationFrame;
 const bindingOf = request => request && Object.fromEntries(
-  ['id', 'tabId', 'frameId', 'documentId', 'activation', 'requestToken'].map(field => [field, request[field]])
+  ['id', 'tabId', 'frameId', 'documentId', 'activation', 'requestToken', 'navigationTab', 'navigationFrame'].map(field => [field, request[field]])
 );
 const requestEnded = () => Object.assign(new Error('This page request is no longer active. Ask the site to request it again.'), { code: 4900 });
 
 // Never retry against just a frame: a new document can reuse that frame.
 const deliver = async (target, message) => {
-  if (!validTarget(target)) return false;
+  if (!validTarget(target) || !(await nativeNavigation.matches(target))) return false;
   let timer;
   try {
     const reply = await Promise.race([
@@ -35,9 +39,9 @@ const deliver = async (target, message) => {
   } catch (error) { return false; }
   finally { clearTimeout(timer); }
 };
-const isLive = (target, requireRequest = false) => {
-  if (requireRequest && !validRequest(target)) return Promise.resolve(false);
-  return deliver(target, { channel: 'znn', kind: 'probe', requireRequest });
+const isLive = async (target, requireRequest = false) => {
+  if (requireRequest && !validRequest(target)) return false;
+  return await deliver(target, { channel: 'znn', kind: 'probe', requireRequest }) && await nativeNavigation.matches(target);
 };
 
 export { validTarget, validRequest, targetFrom, sameDocument, sameRequest, bindingOf, requestEnded, deliver, isLive };

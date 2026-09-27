@@ -30,7 +30,7 @@
     "default_title": "Syrius",
     "default_popup": "popup.html"
   },
-  "permissions": ["storage", "alarms"],
+  "permissions": ["storage", "alarms", "webNavigation"],
   "icons": {
     "128": "icon-128.png"
   },

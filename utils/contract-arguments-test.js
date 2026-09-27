@@ -47,12 +47,13 @@ const { decodeCall, signatures } = load('src/services/utils/contractCalls.js');
 const ArgumentRows = load('src/components/contract-call-arguments/contract-call-arguments.js').default;
 const signature = method => `${method.name}(${method.inputs.map(x => x.type).join(',')})`;
 const selector = text => crypto.createHash('sha3-256').update(text).digest().subarray(0, 4);
-const mapping = type => ({ tokenStandard: 'uint80', hash: 'bytes32' })[type] || type;
+const mapping = type => type.endsWith('[]') ? mapping(type.slice(0, -2)) + '[]' : ({ tokenStandard: 'uint80', hash: 'bytes32' })[type] || type;
 const encode = (method, values) => Buffer.concat([selector(signature(method)), Buffer.from(eth.defaultAbiCoder.encode(method.inputs.map(x => mapping(x.type)), values).slice(2), 'hex')]);
 const addressHex = '0x00' + '42'.repeat(19), tokenHex = '0x' + '13'.repeat(10);
 const account = new sdk.Primitives.Address('z', Buffer.from(addressHex.slice(2), 'hex'));
 const token = new sdk.Primitives.TokenStandard(Buffer.from(tokenHex.slice(2), 'hex'));
 const valueFor = (type, index) => {
+  if (type.endsWith('[]')) return [valueFor(type.slice(0, -2), index), valueFor(type.slice(0, -2), index + 1)];
   if (type === 'address') return addressHex;
   if (type === 'tokenStandard') return tokenHex;
   if (type === 'hash') return '0x' + '7a'.repeat(32);
@@ -63,6 +64,7 @@ const valueFor = (type, index) => {
   return BigNumber.from(2).pow(Number(type.slice(4))).sub(index + 1).toString();
 };
 const expectedFor = (type, value) => {
+  if (type.endsWith('[]')) return value.map(entry => expectedFor(type.slice(0, -2), entry));
   if (type === 'address') return account.toString();
   if (type === 'tokenStandard') return token.toString();
   if (type === 'hash') return value.slice(2);
@@ -80,7 +82,7 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
   assert.equal(appSchemas.revision, reference.revision);
   for (const [contract, schema] of Object.entries(appSchemas.contracts)) {
     assert.equal(schema.address, reference.addresses[contract]);
-    const expectedMethods = upstream(contract).filter(method => signatures[contract].includes(signature(method)));
+    const expectedMethods = upstream(contract); // Every function in the pinned protocol, independently of the history subset.
     assert.deepEqual(schema.methods, expectedMethods.map(({ name, inputs }) => ({ name, inputs })));
     for (const method of expectedMethods) {
       const values = method.inputs.map((arg, index) => valueFor(arg.type, index));
@@ -90,15 +92,17 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
       const markup = ReactDOMServer.renderToStaticMarkup(React.createElement(ArgumentRows, { args: decoded.args }));
       method.inputs.forEach((arg, index) => {
         const actual = decoded.args[index], expected = expectedFor(arg.type, values[index]);
-        assert.equal(actual.name, arg.name); assert.equal(actual.type, arg.type); assert.equal(actual.value, expected);
+        assert.equal(actual.name, arg.name); assert.equal(actual.type, arg.type); assert.deepEqual(actual.value, expected);
         const visible = ReactDOMServer.renderToStaticMarkup(React.createElement('dd', null, actual.display));
         assert(markup.includes(visible), 'Full argument must be visible without details/tooltip');
-        assert.equal(actual.display, arg.type === 'string' ? JSON.stringify(expected) : expected);
+        if (Array.isArray(expected)) {
+          expected.forEach((entry, i) => assert(actual.display.includes(`${i + 1}. ${arg.type === 'string[]' ? JSON.stringify(entry) : entry}`)));
+        } else assert.equal(actual.display, arg.type === 'string' ? JSON.stringify(expected) : expected);
         argumentsChecked++;
       });
       if (!method.inputs.length) assert(markup.includes('no arguments'));
       assert(!markup.includes('<details') && !markup.includes(' title='));
-      assert.equal(decodeCall(contract, selector(signature(method)).toString('base64')), method.name, 'history selector API unchanged');
+      assert.equal(decodeCall(contract, selector(signature(method)).toString('base64')), signatures[contract].includes(signature(method)) ? method.name : null, 'history selector API unchanged');
       const bytes = Buffer.from(json.data, 'base64');
       for (const data of [bytes.subarray(0, bytes.length - 1), Buffer.concat([bytes, Buffer.alloc(32)])]) {
         assert.equal(decodeApprovalCall({ ...json, data: data.toString('base64') }).kind, 'unknownCall');
@@ -106,7 +110,21 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
       calls++;
     }
   }
-  assert.equal(calls, 54);
+  assert.equal(calls, 77);
+  // Array controls cover empty/nonempty tails and visible ordered values.
+  for (const guardians of [[], [addressHex], [addressHex, addressHex, addressHex]]) {
+    const decoded = decodeApprovalCall(known('bridge', 'NominateGuardians', [guardians]));
+    assert.equal(decoded.kind, 'knownCall'); assert.deepEqual(decoded.args[0].value, guardians.map(() => account.toString()));
+    assert(Object.isFrozen(decoded.args[0].value));
+    if (!guardians.length) assert.equal(decoded.args[0].display, '(empty list)');
+  }
+  for (const names of [[], [''], ['\ufeffToken', 'second\u202e', '界🌍']]) {
+    const decoded = decodeApprovalCall(known('liquidity', 'SetTokenTuple', [names, names.map(() => 100), names.map(() => 200), names.map(() => '9999999999999999999999')]));
+    assert.equal(decoded.kind, 'knownCall'); assert.deepEqual(decoded.args[0].value, names);
+    assert(!/[\p{Cf}\p{Zl}\p{Zp}]/u.test(decoded.args[0].display));
+    names.forEach((value, i) => assert.equal(JSON.parse(decoded.args[0].display.split('\n')[i].slice(3)), value));
+  }
+  assert.equal(decodeApprovalCall(known('bridge', 'ProposeAdministrator', [addressHex])).args[0].label, 'Proposed administrator');
   // Signed bounds, empty strings/bytes, Unicode and formatting controls remain exact.
   for (const duration of ['-9223372036854775808', '-1', '0', '9223372036854775807']) {
     assert.equal(decodeApprovalCall(known('stake', 'Stake', [duration])).args[0].value, duration);
@@ -131,11 +149,21 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
     mutateWord(known('pillar', 'Delegate', ['abc']), 0, 0n),
     mutateWord(known('pillar', 'Delegate', ['abc']), 0, 33n),
     mutateWord(known('pillar', 'Delegate', ['abc']), 1, (1n << 256n) - 1n),
+    mutateWord(known('bridge', 'NominateGuardians', [[addressHex]]), 1, (1n << 256n) - 1n),
+    mutateWord(known('bridge', 'NominateGuardians', [[addressHex]]), 2, 1n << 160n),
   ];
   const text = known('pillar', 'Delegate', ['abc']);
   for (const [position, value] of [[68, 255], [99, 1]]) {
     const bytes = Buffer.from(text.data, 'base64'); bytes[position] = value; invalid.push({ ...text, data: bytes.toString('base64') });
   }
+  const arrays = known('liquidity', 'SetTokenTuple', [['abc', 'def'], [100, 200], [300, 400], ['500', '600']]);
+  for (const [index, value] of [[5, 0n], [5, 65n], [6, 64n], [5, (1n << 256n) - 1n]]) invalid.push(mutateWord(arrays, index, value));
+  for (const [position, value] of [[260, 255], [291, 1]]) {
+    const bytes = Buffer.from(arrays.data, 'base64'); bytes[position] = value; invalid.push({ ...arrays, data: bytes.toString('base64') });
+  }
+  // Locate the uint32 array through its independently encoded outer offset.
+  const uintArrayWord = Number(BigInt('0x' + Buffer.from(arrays.data, 'base64').subarray(36, 68).toString('hex'))) / 32;
+  invalid.push(mutateWord(arrays, uintArrayWord + 1, 1n << 32n));
   for (const json of invalid) assert.equal(decodeApprovalCall(json).kind, 'unknownCall');
   assert.equal(decodeApprovalCall({ ...text, blockType: 3 }).kind, 'unknownCall');
   assert.equal(decodeApprovalCall({ ...text, toAddress: account.toString() }).kind, 'unknownCall');
@@ -155,7 +183,7 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
   const vault = { getKeyPair: () => key, getSigningKeyPair: async () => { await pause('key'); return key; } };
   zenon.ledger.getFrontierBlock = async () => { await pause('rpc'); if (networkFailure) throw Error('Inert offline fixture'); return null; };
   zenon.ledger.getFrontierMomentum = async () => ({ hash: emptyHash, height: 1 });
-  zenon.ledger.publishRawTransaction = async block => { published++; assert.equal(block.signature.length, 64); };
+  zenon.ledger.publishRawTransaction = async block => { await pause('publish'); published++; assert.equal(block.signature.length, 64); };
   zenon.embedded.plasma.getRequiredPoWForAccountBlock = async () => { await pause('pow'); return { requiredDifficulty: 0, basePlasma: 0, availablePlasma: 0 }; };
   const reactHook = { useCallback: fn => fn, useState: initial => [initial, () => {}] };
   const guardedLoad = loader(id => {
@@ -229,7 +257,8 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
   // scheduling is explicit; RPC/key/publication are the same inert SDK controls.
   const ui = initial => {
     const states = [], refs = [], callbacks = [], effects = [], notifications = [];
-    let si, ri, ci, ei, tree, queue = initial;
+    let si, ri, ci, ei, tree, internalGate, queue = initial;
+    const internalCalls = [];
     const state = { wallet: { address: account.toString(), isUnlocked: true }, connectionParameters: { chainIdentifier: 1, nodeUrl: 'wss://fixture.invalid' } };
     const same = (a, b) => a && b && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
     const hooks = { ...React,
@@ -239,6 +268,8 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
       useEffect: (fn, deps) => { const i = ei++; if (!same(effects[i]?.deps, deps)) effects[i] = { fn, deps, cleanup: effects[i]?.cleanup, pending: true }; },
     };
     const internal = async (method, params) => {
+      internalCalls.push({ method, params });
+      if (internalGate?.method === method) { const held = internalGate; internalGate = null; held.started.resolve(); await held.release.promise; }
       if (method === 'approvals.next') return queue;
       if (method === 'approvals.resolve' || method === 'approvals.reject') { if (params.id === queue?.id) queue = null; return true; }
       throw Error('Unexpected internal method ' + method);
@@ -263,7 +294,7 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
     const button = text => flatten(tree).find(node => node.type === 'button' && node.props.children === text);
     const settle = async () => { for (let i = 0; i < 10; i++) { await tick(); render(); } };
     render();
-    return { render, settle, state, notifications, button, markup: () => ReactDOMServer.renderToStaticMarkup(tree), next: value => { queue = value; },
+    return { render, settle, state, notifications, internalCalls, holdInternal: method => (internalGate = { method, started: deferred(), release: deferred() }), button, markup: () => ReactDOMServer.renderToStaticMarkup(tree), next: value => { queue = value; },
       dispose: () => effects.forEach(effect => effect.cleanup?.()) };
   };
   const request = (id, json) => ({ id, type: 'signAndSendBlock', origin: 'https://fixture.invalid', params: blockFor(json) });
@@ -307,6 +338,46 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
     const fixture = ui(malformed); await fixture.settle(); assert(fixture.markup().includes('Unable to prepare'));
     assert.equal(fixture.button('Sign and send').props.disabled, true); fixture.dispose();
   }
+  // Submission is explicitly irrevocable: Reject is disabled and even a
+  // captured pre-render callback cannot falsely cancel the approved operation.
+  for (const phase of ['key', 'rpc', 'pow', 'sign', 'publish']) {
+    const fixture = ui(request('submit-' + phase, call)); await fixture.settle();
+    const rejectBeforeRender = fixture.button('Reject').props.onClick;
+    const held = { phase, started: deferred(), release: deferred() }; gate = held;
+    const count = published, result = fixture.button('Sign and send').props.onClick();
+    await rejectBeforeRender(); await held.started.promise; await fixture.settle();
+    assert.equal(fixture.button('Reject').props.disabled, true);
+    assert(fixture.markup().includes('can no longer be rejected'));
+    await fixture.button('Reject').props.onClick();
+    assert.equal(fixture.internalCalls.filter(x => x.method === 'approvals.reject').length, 0);
+    held.release.resolve(); await result; assert.equal(published, count + 1);
+    assert.equal(fixture.internalCalls.filter(x => x.method === 'approvals.resolve').length, 1);
+    fixture.dispose();
+  }
+  // Rejection first invalidates the captured approval before messaging/render.
+  {
+    const first = request('reject-first', call), fixture = ui(first); await fixture.settle();
+    const approveBeforeRender = fixture.button('Sign and send').props.onClick;
+    const held = fixture.holdInternal('approvals.reject'), count = signed;
+    const result = fixture.button('Reject').props.onClick(); await held.started.promise;
+    await approveBeforeRender(); fixture.render(); assert.equal(signed, count);
+    assert.equal(fixture.button('Sign and send').props.disabled, true);
+    fixture.next(request('after-rejection', known('stake', 'Stake', [42])));
+    held.release.resolve(); await result; await fixture.settle();
+    assert.equal(fixture.button('Sign and send').props.disabled, false); fixture.dispose();
+  }
+  // Late network preparation cannot revive a request already rejected locally.
+  {
+    const held = { phase: 'rpc', started: deferred(), release: deferred() }; gate = held;
+    const fixture = ui(request('rejected-preparation', call)); await fixture.settle(); await held.started.promise;
+    const rejecting = fixture.holdInternal('approvals.reject'), result = fixture.button('Reject').props.onClick();
+    await rejecting.started.promise; held.release.resolve(); await fixture.settle();
+    assert.equal(fixture.button('Sign and send').props.disabled, true);
+    assert(!fixture.markup().includes('Plasma beneficiary'));
+    fixture.next(request('fresh-after-rejection', known('stake', 'Stake', [42])));
+    rejecting.release.resolve(); await result; await fixture.settle();
+    assert.equal(fixture.button('Sign and send').props.disabled, false); fixture.dispose();
+  }
   if (process.env.SYRIUS_CALL_UI_ARTIFACT_DIR) {
     const dir = path.resolve(process.env.SYRIUS_CALL_UI_ARTIFACT_DIR); fs.mkdirSync(dir, { recursive: true });
     const css = require('sass').compile(path.join(root, 'src/sections/Popup/Popup.scss')).css;
@@ -314,6 +385,9 @@ const watchdog = setTimeout(() => { console.error('Contract argument checks time
       ['token', known('token', 'IssueToken', ['Community token', 'COMM', 'community.invalid', '100000000000000000000000000001', '200000000000000000000000000000', 8, true, false, false])],
       ['htlc', known('htlc', 'Create', [addressHex, 1900000000, 0, 32, '0x' + '7a'.repeat(32)])],
       ['unicode', known('pillar', 'Delegate', ['Leading BOM: \ufeff and direction: \u202e / ordinary Unicode 界 🌍'])],
+      ['arrays', known('liquidity', 'SetTokenTuple', [[token.toString(), 'zts1znnxxxxxxxxxxxxx9z4ulx'], [5000, 5000], [2500, 7500], ['100000000000000000001', '200000000000000000002']])],
+      ['guardians', known('bridge', 'NominateGuardians', [[addressHex, '0x00' + '43'.repeat(19), '0x00' + '44'.repeat(19)]])],
+      ['administrator', known('bridge', 'ProposeAdministrator', [addressHex])],
     ];
     for (const [name, json] of samples) {
       const fixture = ui(request('layout-' + name, json)); await fixture.settle();

@@ -97,10 +97,11 @@ const SiteIntegrationLayout = () => {
   const [isWaitingForMore, setIsWaitingForMore] = useState(false);
   const rendered = useRef(null);
   const callBusy = useRef(false);
+  const discardedCall = useRef(null);
   rendered.current = { request, preview, address, isUnlocked, chainIdentifier, nodeUrl };
   const currentPreview = preview && preview.request === request && preview.address === address &&
     preview.chainIdentifier === chainIdentifier && preview.nodeUrl === nodeUrl && isUnlocked ? preview : null;
-  const currentCall = currentPreview?.approval ? currentPreview : null;
+  const currentCall = currentPreview?.approval && discardedCall.current !== request ? currentPreview : null;
 
 
   // A locked wallet cannot answer anything. The password screen is told where
@@ -177,9 +178,9 @@ const SiteIntegrationLayout = () => {
     let cancelled = false;
     const context = { request, address, chainIdentifier, nodeUrl };
     prepareCallApproval(request.params).then(approval => {
-      if (!cancelled) setPreview({ ...context, approval });
+      if (!cancelled && discardedCall.current !== request) setPreview({ ...context, approval });
     }).catch(error => {
-      if (!cancelled) setPreview({ ...context, error: readableError(error) });
+      if (!cancelled && discardedCall.current !== request) setPreview({ ...context, error: readableError(error) });
     });
     return () => { cancelled = true; };
   }, [request, address, isUnlocked, chainIdentifier, nodeUrl]);
@@ -190,8 +191,13 @@ const SiteIntegrationLayout = () => {
   };
 
   const reject = async () => {
-    if (!request) {
-      return;
+    if (!request || rendered.current.request !== request || callBusy.current) return;
+    if (request.type === 'signAndSendBlock') {
+      // Reject wins before any await or React render. Once submission starts,
+      // it cannot be recalled, so its Reject control is disabled instead.
+      discardedCall.current = request;
+      rendered.current.preview = null;
+      setPreview(null);
     }
     await sendInternal('approvals.reject', { id: request.id });
     await loadNext();
@@ -275,7 +281,7 @@ const SiteIntegrationLayout = () => {
   //
   const approveSignAndSend = async () => {
     const selected = currentCall;
-    const isCurrent = () => Boolean(selected && rendered.current.isUnlocked &&
+    const isCurrent = () => Boolean(selected && discardedCall.current !== selected.request && rendered.current.isUnlocked &&
       rendered.current.request === selected.request && rendered.current.preview === selected &&
       rendered.current.address === selected.address && rendered.current.chainIdentifier === selected.chainIdentifier &&
       rendered.current.nodeUrl === selected.nodeUrl);
@@ -614,6 +620,7 @@ const SiteIntegrationLayout = () => {
             {currentCall && !currentCall.approval.networkPrepared && (
               <p className="approval-note">Current network details are unavailable. Signing will retry the connection.</p>
             )}
+            {busy && <p className="approval-note" role="status">Submission has started. This approval can no longer be rejected.</p>}
             <details className="block-preview-details">
               <summary>Raw transaction data</summary>
               <pre className="block-preview">
@@ -633,6 +640,7 @@ const SiteIntegrationLayout = () => {
               type="button"
               className="button secondary w-100"
               onClick={reject}
+              disabled={busy || discardedCall.current === request}
             >
               Reject
             </button>

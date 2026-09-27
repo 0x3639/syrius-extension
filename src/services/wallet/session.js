@@ -93,16 +93,21 @@ const restore = (original, keyStore, commit, prepare = () => {}) => state.run(as
 const isCurrent = (expected) => state.run(async () => {
   try { assert(await state.read(), expected); return true; } catch (error) { return false; }
 });
-const touch = (expected) => state.run(async () => {
-  const current = await state.read();
-  // Renewal is optional after a successful password save. A policy change must
-  // suppress renewal without misreporting the already-completed password save.
-  try { assert(current, expected); } catch (error) { return false; }
-  const next = recordFor({ ...current, entropy: vault.getEntropy() }, current.minutes, current.id);
-  await advance(current, next);
-  bind(next);
-  return true;
-});
+const touch = async (expected) => {
+  // Password persistence has already succeeded before this optional renewal.
+  // Preserve the base boolean contract for stale authority AND storage failure.
+  try {
+    return await state.run(async () => {
+      const current = await state.read();
+      assert(current, expected);
+      const next = recordFor({ ...current, entropy: vault.getEntropy() }, current.minutes, current.id);
+      await advance(current, next);
+      bind(next);
+      return true;
+    });
+  } catch (error) { return false; }
+};
+
 const select = async (expected, index, maxAddressIndex, commit) => {
   if (!sameVault(expected) || !Number.isInteger(index) || index < 0 || index >= maxAddressIndex) throw changed();
   const key = vault.getKeyPair(index);
@@ -173,8 +178,11 @@ const updateSetting = async (key, value) => {
       // Timed -> On close both removes resumability and relaxes the owner's
       // lifetime. The intermediate state must keep the intersection: no entropy
       // and the original private deadline until preference persistence succeeds.
+      // Conversely, local -> timed must install the new private deadline before
+      // saving that finite preference, while still withholding resumable entropy.
       const stage = removesDeadline ? { ...next, revision: crypto.randomUUID(), privateUntil: previousDeadline } :
-        relaxing ? { ...current, revision: crypto.randomUUID() } : next;
+        current.mode === 'local' && value > 0 ? { ...current, revision: crypto.randomUUID(), privateUntil: next.expiresAt } :
+          relaxing ? { ...current, revision: crypto.randomUUID() } : next;
       if (relaxing) await advance(current, stage);
       else await state.write(stage, publicValue);
       bind(stage);

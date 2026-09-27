@@ -33,7 +33,7 @@ const fixture = () => {
   let now = 1000000, failSessionWrite = 0;
   class Clock extends Date { static now() { return now; } }
   const session = {}, local = {}, disk = new Map(), queues = new Map(), handlers = {}, changes = [];
-  const messages = [], events = [], faults = {}, waits = new Map();
+  const messages = [], events = [], faults = {}, waits = new Map(), credentials = new Map();
   const hold = name => { const gate = { started: deferred(), release: deferred() }; waits.set(name, gate); return gate; };
   const pause = async name => { const gate = waits.get(name); if (gate) { waits.delete(name); gate.started.resolve(); await gate.release.promise; } };
   const locks = { request: async (name, fn) => {
@@ -65,9 +65,9 @@ const fixture = () => {
     fromEntropy(entropy) { this.entropy = entropy; return this; }
     getKeyPair(index) { const entropy = this.entropy; return { getAddress: async () => { await pause('address'); return { toString: () => entropy + '-address-' + index }; } }; }
   }, KeyStoreManager: function () { return {
-    readKeyStore: async (password, name) => { await pause('password'); if (password !== 'fixture') throw Error('Error decrypting'); return new sdk.KeyStore().fromEntropy(name); },
+    readKeyStore: async (password, name) => { await pause('password'); if (password !== (credentials.has(name) ? credentials.get(name) : 'fixture')) throw Error('Error decrypting'); return new sdk.KeyStore().fromEntropy(name); },
     listAllKeyStores: () => JSON.parse(disk.get('znn.ts-wallet') || '{}'),
-    saveKeyStore: async () => { await pause('savePassword'); events.push('password saved'); },
+    saveKeyStore: async (store, password, name) => { await pause('savePassword'); credentials.set(name, password); events.push('password saved'); },
   }; }, Constants: { defaultChainId: 1 }, Primitives: { Address: { parse: value => ({ toString: () => value }) } }, Zenon: {
     getSingleton: () => ({ initialize: async () => pause('node'), clearSocketConnection() {} }), getChainIdentifier: () => 1,
   } };
@@ -373,6 +373,44 @@ const watchdog = setTimeout(() => { console.error('Session policy checks timed o
       assert.equal(second.vault.isUnlocked(), true); assert.equal(f.record().mode, 'timed');
       assert.equal(ui.navigations.at(-1)[0], '/tabs/dashboard'); assert.equal(ui.notices.length, 0);
     }
+  }
+  // Both directions across local/timed authority stage the intersection.
+  // A persisted finite preference must never hide an unbounded local owner.
+  for (const failure of ['preference', 'final-session']) {
+    const f = fixture(); f.disk.set('syrius.settings', JSON.stringify({ autoLockMinutes: 0 })); await f.unlock();
+    const deadline = f.now() + 300000;
+    if (failure === 'preference') f.faults.disk = 'syrius.settings'; else f.failWrite(2);
+    await assert.rejects(f.api.updateSetting('autoLockMinutes', 5), /save settings|storage write failed/);
+    assert.equal(f.record().mode, 'local'); assert.equal(f.record().privateUntil, deadline);
+    assert.equal('entropy' in f.record(), false); assert.equal(f.public(), null);
+    const remounted = f.ui('src/pages/settings/settings/settings.js');
+    const shown = failure === 'preference' ? 'On close' : '5 min';
+    assert(remounted.find(node => node.type === 'button' && node.props.children === shown).props.className.includes('is-selected'));
+    f.advance(1000); await f.api.touch(f.api.capture()); assert.equal(f.record().privateUntil, deadline);
+    await f.api.select(f.api.capture(), 1, 2, () => {}); assert.equal(f.record().privateUntil, deadline);
+    f.advance(deadline - f.now()); assert.equal(await f.api.isCurrent(f.api.capture()), false);
+    assert.equal(await f.api.touch(f.api.capture()), false);
+    await f.handlers.alarm({ name: 'znn.autoLock' }); assert.equal(f.record().mode, 'ended');
+  }
+  {
+    const f = fixture(); f.disk.set('syrius.settings', JSON.stringify({ autoLockMinutes: 0 })); await f.unlock();
+    f.failWrite(2); await assert.rejects(f.api.updateSetting('autoLockMinutes', 5)); const deadline = f.record().privateUntil;
+    f.advance(1000); await f.api.updateSetting('autoLockMinutes', 5);
+    assert.equal(f.record().expiresAt, deadline); assert.equal(f.record().entropy, 'A');
+  }
+  for (const failure of ['session:get', 'session:set']) {
+    const f = fixture(); await f.unlock(); const before = f.record();
+    const ui = f.ui('src/pages/settings/change-password/change-password.js');
+    ui.find(node => node.type === 'input' && node.props.placeholder === 'Current password').props.onChange({ target: { value: 'fixture' } });
+    ui.find(node => node.type === 'input' && node.props.placeholder === 'New password').props.onChange({ target: { value: 'new-fixture-password' } }); ui.render();
+    const gate = f.hold('savePassword'); const saving = ui.find(node => node.type === 'form').props.onSubmit();
+    await gate.started.promise;
+    if (failure.endsWith('get')) f.faults[failure] = true; else f.failWrite();
+    gate.release.resolve(); await saving;
+    assert(f.events.includes('password saved')); assert(ui.notices.some(item => item.success === 'Password changed'));
+    assert.equal(ui.notices.filter(item => item.error).length, 0); assert.equal(ui.navigations.at(-1)[0], '/tabs/settings');
+    assert.equal(await f.vault.verifyPassword('fixture'), false); assert.equal(await f.vault.verifyPassword('new-fixture-password'), true);
+    assert.deepEqual(f.record(), before);
   }
   // Installed pinned SDK derivation/entropy compatibility with public fixture
   // entropy only. The SDK connection remains an inert facade; no RPC exists.

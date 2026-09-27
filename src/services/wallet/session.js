@@ -44,7 +44,8 @@ const load = () => state.run(async () => {
   if (state.timed(current)) return current;
   // An On close owner's marker has no entropy and is never resumable. Reading
   // it from a fresh document must not revoke that owner's private session.
-  if (current && current.mode !== 'local' && current.mode !== 'ended') await state.write(state.ended());
+  if (current && ((current.mode !== 'local' && current.mode !== 'ended') ||
+    (current.mode === 'local' && current.privateUntil && current.privateUntil <= Date.now()))) await state.write(state.ended());
   return null;
 });
 const clear = (expected) => {
@@ -63,24 +64,27 @@ const recordFor = (values, minutes, id = crypto.randomUUID()) => ({
   walletName: values.walletName, selectedAddressIndex: values.selectedAddressIndex,
   lastActiveAt: Date.now(), expiresAt: minutes ? Date.now() + minutes * 60000 : 0,
   mode: minutes ? 'timed' : 'local', ...(minutes ? { entropy: values.entropy } : {}),
+  ...(!minutes && values.privateUntil ? { privateUntil: values.privateUntil } : {}),
 });
 const adopt = (record, keyStore) => {
   vault.adopt(record.walletName, keyStore);
   vault.setSelectedIndex(record.selectedAddressIndex);
   bind(record);
 };
-const create = (expected, values, keyStore, commit) => state.run(async () => {
+const create = (expected, values, keyStore, commit, prepare = () => {}) => state.run(async () => {
   if (!state.matches(await state.read(), expected)) throw changed();
   const next = recordFor(values, preferredMinutes());
+  prepare();
   await state.write(next);
   adopt(next, keyStore);
   commit();
   return capture();
 });
-const restore = (original, keyStore, commit) => state.run(async () => {
+const restore = (original, keyStore, commit, prepare = () => {}) => state.run(async () => {
   const current = await state.read();
   if (!state.matches(current, original) || !state.timed(current)) throw changed();
   const next = recordFor(current, current.minutes, current.id);
+  prepare();
   await advance(current, next);
   adopt(next, keyStore);
   commit();
@@ -118,19 +122,22 @@ const select = async (expected, index, maxAddressIndex, commit) => {
   });
 };
 const publish = async (expected, values) => {
-  if (!sameVault(expected)) return false;
-  // Derive from the captured handle, never from a stale Redux address or the
-  // vault's asynchronous address cache (which could finish after replacement).
-  const key = vault.getKeyPair(expected.index);
-  const address = (await key.getAddress()).toString();
-  return state.run(async () => {
-    const current = await state.read();
-    try { assert(current, expected); } catch (error) { return false; }
-    if (!state.timed(current)) return false;
-    await state.write(current, { ...values, address, token: state.token(current) });
-    return true;
-  });
+  // Public advertisement is best-effort. Its storage/hash failures must not
+  // turn an already-committed unlock into an apparent password failure.
+  try {
+    if (!sameVault(expected)) return false;
+    const key = vault.getKeyPair(expected.index);
+    const address = (await key.getAddress()).toString();
+    return await state.run(async () => {
+      const current = await state.read();
+      assert(current, expected);
+      if (!state.timed(current)) return false;
+      await state.write(current, { ...values, address, token: state.token(current) });
+      return true;
+    });
+  } catch (error) { return false; }
 };
+
 const updateSetting = async (key, value) => {
   const expected = capture();
   const address = key === 'autoLockMinutes' && expected ?
@@ -141,25 +148,33 @@ const updateSetting = async (key, value) => {
       if (key !== 'autoLockMinutes') return persistSetting(key, value);
       if (!minutesValid(value)) throw new Error('Choose a supported lock duration.');
       const current = await state.read();
-      if (!state.timed(current) && current?.mode !== 'local') {
+      if (!state.timed(current) && (current?.mode !== 'local' ||
+        (current.privateUntil && current.privateUntil <= Date.now()))) {
         const ended = await state.write(state.ended());
         updatedToken = state.token(ended);
         return persistSetting(key, value);
       }
       assert(current, expected);
       const entropy = vault.getEntropy();
+      const previousDeadline = current.mode === 'timed' ? current.expiresAt : current.privateUntil;
       const next = { ...current, revision: crypto.randomUUID(), ownerId, minutes: value,
         mode: value ? 'timed' : 'local',
-        expiresAt: value ? (current.mode === 'timed' ? Math.min(current.expiresAt, Date.now() + value * 60000) : Date.now() + value * 60000) : 0 };
+        expiresAt: value ? (previousDeadline ? Math.min(previousDeadline, Date.now() + value * 60000) : Date.now() + value * 60000) : 0 };
       delete next.entropy;
+      delete next.privateUntil;
       if (value) next.entropy = entropy;
       const publicValue = state.timed(next) ? { address, chainId: Zenon.getChainIdentifier(),
         nodeUrl: getCurrentNodeUrl(), token: state.token(next) } : null;
       // Before preference persistence only tighten authority. If a relaxation's
       // second write fails, the stored policy may be newer but the current
       // session remains stricter; report failure and allow an explicit retry.
-      const relaxing = value > 0 && (current.mode === 'local' || value > current.minutes);
-      const stage = relaxing ? { ...current, revision: crypto.randomUUID() } : next;
+      const removesDeadline = value === 0 && Boolean(previousDeadline);
+      const relaxing = removesDeadline || (value > 0 && (current.mode === 'local' || value > current.minutes));
+      // Timed -> On close both removes resumability and relaxes the owner's
+      // lifetime. The intermediate state must keep the intersection: no entropy
+      // and the original private deadline until preference persistence succeeds.
+      const stage = removesDeadline ? { ...next, revision: crypto.randomUUID(), privateUntil: previousDeadline } :
+        relaxing ? { ...current, revision: crypto.randomUUID() } : next;
       if (relaxing) await advance(current, stage);
       else await state.write(stage, publicValue);
       bind(stage);

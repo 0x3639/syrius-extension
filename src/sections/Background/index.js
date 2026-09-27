@@ -438,7 +438,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
   await sessionState.run(async () => {
     const current = await sessionState.read();
-    if (current?.mode === 'timed' && !sessionState.timed(current)) {
+    if ((current?.mode === 'timed' && !sessionState.timed(current)) ||
+      (current?.mode === 'local' && current.privateUntil && current.privateUntil <= Date.now())) {
       await sessionState.write(sessionState.ended());
       await broadcast('accountsChanged', []);
     }

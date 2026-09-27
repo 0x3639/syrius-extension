@@ -9,7 +9,8 @@ const matches = (record, expected) => record === null ? expected === null :
 const timed = (record) => Boolean(record?.version === 1 && record.mode === 'timed' &&
   record.entropy && record.expiresAt > Date.now());
 const live = (record, ownerId) => timed(record) || Boolean(record?.version === 1 &&
-  record.mode === 'local' && record.ownerId === ownerId && ownerId);
+  record.mode === 'local' && record.ownerId === ownerId && ownerId &&
+  (!record.privateUntil || record.privateUntil > Date.now()));
 const ended = () => ({ version: 1, id: crypto.randomUUID(), revision: crypto.randomUUID(), mode: 'ended' });
 const read = async () => (await chrome.storage.session.get(sessionKey))[sessionKey] || null;
 // Clear the old public snapshot in the same storage commit as each revision.

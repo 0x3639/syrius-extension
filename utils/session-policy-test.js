@@ -315,6 +315,65 @@ const watchdog = setTimeout(() => { console.error('Session policy checks timed o
     assert(ui.notices.some(item => item.error)); assert.equal(ui.navigations.at(-1)[0], '/password');
     assert.equal(f.vault.isUnlocked(), false);
   }
+  // A failed timed -> On close transition keeps BOTH restrictions: no
+  // resumable entropy and the old finite owner deadline, until a saved retry.
+  for (const failure of ['preference', 'final-session']) {
+    const f = fixture(); await f.unlock(); const before = f.record();
+    if (failure === 'preference') f.faults.disk = 'syrius.settings'; else f.failWrite(2);
+    await assert.rejects(f.api.updateSetting('autoLockMinutes', 0), /save settings|storage write failed/);
+    assert.equal(f.record().mode, 'local'); assert.equal(f.record().privateUntil, before.expiresAt);
+    assert.equal('entropy' in f.record(), false); assert.equal(f.public(), null);
+    const fresh = f.realm(); assert.equal(await fresh.api.load(), null);
+    f.advance(1000); assert.equal(await f.api.touch(f.api.capture()), true);
+    assert.equal(f.record().privateUntil, before.expiresAt); assert.equal('entropy' in f.record(), false);
+    await f.api.select(f.api.capture(), 1, 2, () => {});
+    assert.equal(f.record().privateUntil, before.expiresAt); assert.equal('entropy' in f.record(), false);
+    f.advance(before.expiresAt - f.now());
+    assert.equal(await f.api.isCurrent(f.api.capture()), false); assert.equal(await f.api.touch(f.api.capture()), false);
+    await f.handlers.alarm({ name: 'znn.autoLock' }); assert.equal(f.record().mode, 'ended');
+  }
+  {
+    const f = fixture(); await f.unlock(); f.faults.disk = 'syrius.settings';
+    await assert.rejects(f.api.updateSetting('autoLockMinutes', 0)); delete f.faults.disk;
+    await f.api.updateSetting('autoLockMinutes', 0);
+    assert.equal('privateUntil' in f.record(), false); assert.equal('entropy' in f.record(), false);
+    f.advance(3600000); assert.equal(await f.api.isCurrent(f.api.capture()), true);
+  }
+  {
+    const f = fixture(); await f.unlock(); const before = f.record(); f.faults.disk = 'syrius.settings';
+    await assert.rejects(f.api.updateSetting('autoLockMinutes', 0)); delete f.faults.disk;
+    f.advance(1000); await f.api.updateSetting('autoLockMinutes', 60);
+    assert.equal(f.record().expiresAt, before.expiresAt); assert.equal(f.record().entropy, 'A');
+  }
+  {
+    const f = fixture(); await f.unlock(); const ui = f.ui('src/pages/settings/settings/settings.js');
+    f.faults.disk = 'syrius.settings'; await ui.find(node => node.type === 'button' && node.props.children === 'On close').props.onClick(); ui.render();
+    assert(ui.notices.some(item => item.error)); assert(ui.find(node => node.type === 'button' && node.props.children === '15 min').props.className.includes('is-selected'));
+    assert(f.record().privateUntil); assert.equal('entropy' in f.record(), false);
+  }
+  // Required startup persistence fails before adoption. Optional node/public
+  // advertisement failure leaves a successful, truthful unlocked screen.
+  for (const failure of ['last-wallet', 'node-url', 'publication-read', 'publication-write']) {
+    const f = fixture(); await f.unlock(); f.disk.set('znn.ts-wallet', JSON.stringify({ A: { encrypted: 'fixture' } }));
+    const second = f.realm(); let gate;
+    if (failure === 'last-wallet') f.faults.disk = 'syrius.lastWalletName';
+    if (failure === 'node-url') f.faults.disk = 'currentNodeUrl';
+    if (failure.startsWith('publication')) gate = f.hold('node');
+    const ui = f.ui('src/layouts/mainLayout/mainLayout.js', second);
+    if (gate) {
+      await gate.started.promise; assert.equal(second.vault.isUnlocked(), true);
+      if (failure === 'publication-read') f.faults['session:get'] = true; else f.failWrite();
+      gate.release.resolve();
+    }
+    await flush(); ui.render();
+    if (failure === 'last-wallet') {
+      assert.equal(second.vault.isUnlocked(), false); assert.equal(f.record().mode, 'ended');
+      assert.equal(ui.navigations.at(-1)[0], '/password');
+    } else {
+      assert.equal(second.vault.isUnlocked(), true); assert.equal(f.record().mode, 'timed');
+      assert.equal(ui.navigations.at(-1)[0], '/tabs/dashboard'); assert.equal(ui.notices.length, 0);
+    }
+  }
   // Installed pinned SDK derivation/entropy compatibility with public fixture
   // entropy only. The SDK connection remains an inert facade; no RPC exists.
   {

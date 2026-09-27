@@ -10,6 +10,7 @@ import { signMessage } from '../../services/wallet/signMessage';
 import { sendInternal } from '../../services/utils/messaging';
 import { identityOf, freezeApproval, approvalEnded } from '../../services/utils/approvalIdentity';
 import withApprovalDeadline from '../../services/utils/approvalDeadline';
+import { runApprovalOperation } from '../../services/wallet/approvalOperation';
 import {
   formatAmount,
   formatExact,
@@ -118,7 +119,7 @@ const SiteIntegrationLayout = () => {
   const [preview, setPreview] = useState(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isWaitingForMore, setIsWaitingForMore] = useState(false);
-  const rendered = useRef(null), operation = useRef(null), discarded = useRef(null), mounted = useRef(true);
+  const rendered = useRef(null), operation = useRef(null), discarded = useRef(null), mounted = useRef(true), previewOwner = useRef(null);
   rendered.current = { request, address, isUnlocked, chainIdentifier, nodeUrl };
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const currentView = selected => mounted.current && selected?.request && discarded.current !== selected.request &&
@@ -219,6 +220,8 @@ const SiteIntegrationLayout = () => {
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
+    previewOwner.current = controller;
 
     (async () => {
       try {
@@ -227,11 +230,9 @@ const SiteIntegrationLayout = () => {
           request.params
         );
         const keyPair = vault.getKeyPair();
-        const filled = await sdkUtils.BlockUtils._checkAndSetFields(
-          zenon,
-          template,
-          keyPair
-        );
+        const filled = await runApprovalOperation(request.expiresAt,
+          active => sdkUtils.BlockUtils._checkAndSetFields(active.context(zenon), template, keyPair),
+          { signal: controller.signal });
 
         if (!cancelled) {
           setPreview(filled.toJson());
@@ -248,12 +249,15 @@ const SiteIntegrationLayout = () => {
 
     return () => {
       cancelled = true;
+      controller.abort();
+      if (previewOwner.current === controller) previewOwner.current = null;
     };
   }, [request]);
 
   const approve = async (execute, success) => {
     const selected = { request, address, chainIdentifier, nodeUrl };
     if (operation.current || !currentView(selected)) return;
+    previewOwner.current?.abort();
     const active = { kind: 'approval', selected, identity: identityOf(request), claimed: false };
     operation.current = active;
     setIsBusy(true);
@@ -320,7 +324,8 @@ const SiteIntegrationLayout = () => {
     return blockResult(await send(template, { assertRequest, expiresAt: selected.expiresAt }));
   }, 'Transaction sent');
   const approveSignMessage = () => approve((selected, assertRequest) =>
-    signMessage(selected.params.message, { assertRequest }), 'Message signed');
+    runApprovalOperation(selected.expiresAt, active => signMessage(selected.params.message, { assertRequest: active.assertActive }),
+      { assertRequest }), 'Message signed');
   const approveSignAndSend = () => approve(async (selected, assertRequest) => {
     const template = Primitives.AccountBlockTemplate.fromJson(selected.params);
     return blockResult(await send(template, { assertRequest, expiresAt: selected.expiresAt }));

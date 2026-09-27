@@ -1,9 +1,10 @@
 import { useCallback, useRef, useState } from 'react';
-import { Enums, Zenon, utils as sdkUtils } from 'znn-ts-sdk';
+import { Enums, Zenon } from 'znn-ts-sdk';
 
 import vault from '../wallet/vault';
 import requestSigningKey from '../wallet/requestSigningKey';
-import withApprovalDeadline from '../utils/approvalDeadline';
+import { runApprovalOperation } from '../wallet/approvalOperation';
+import sendApprovalBlock from '../wallet/approvalBlock';
 import { invalidateAccountCache } from './useAccount';
 
 // Signing and broadcasting one account block, for the one caller that has to
@@ -34,32 +35,22 @@ const useBlockSender = () => {
   const send = useCallback(async (template, { addressIndex, assertRequest, expiresAt } = {}) => {
     const current = ++generation.current;
     const zenon = Zenon.getSingleton();
-    await assertRequest?.();
-    const keyPair = requestSigningKey(await vault.getSigningKeyPair(addressIndex), assertRequest);
-    await assertRequest?.();
-
     setIsSending(true);
-
+    const progress = status => {
+      if (generation.current !== current || (Number.isFinite(expiresAt) && expiresAt <= Date.now())) return;
+      if (status === Enums.PowStatus.generating) setIsGeneratingPlasma(true);
+      if (status === Enums.PowStatus.done) setIsGeneratingPlasma(false);
+    };
     try {
-      // Keep the shared SDK untouched. This operation checks expiry again at
-      // the final publication boundary, after all SDK preparation and signing.
-      const context = Object.create(zenon);
-      context.ledger = Object.create(zenon.ledger);
-      context.ledger.publishRawTransaction = async block => {
-        await assertRequest?.();
-        return zenon.ledger.publishRawTransaction(block);
+      const execute = async operation => {
+        await operation.assertActive();
+        const keyPair = requestSigningKey(await vault.getSigningKeyPair(addressIndex), operation.assertActive);
+        await operation.assertActive();
+        return sendApprovalBlock(zenon, template, keyPair, operation, progress);
       };
-      const signed = await withApprovalDeadline(sdkUtils.BlockUtils.send(context, template, keyPair, (status) => {
-        if (generation.current !== current || (Number.isFinite(expiresAt) && expiresAt <= Date.now())) return;
-        // `PowStatus.generating` is 0, so this has to compare rather than test
-        // for truth — the obvious `if (status)` reads it as "done".
-        if (status === Enums.PowStatus.generating) {
-          setIsGeneratingPlasma(true);
-        }
-        if (status === Enums.PowStatus.done) {
-          setIsGeneratingPlasma(false);
-        }
-      }), expiresAt);
+      const signed = assertRequest
+        ? await runApprovalOperation(expiresAt, execute, { assertRequest })
+        : await zenon.send(template, await vault.getSigningKeyPair(addressIndex), progress);
 
       // The balance on screen is now stale by definition.
       invalidateAccountCache();

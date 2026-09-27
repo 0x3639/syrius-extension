@@ -172,6 +172,10 @@ window.addEventListener(
 // Background -> page
 //
 const receiveResponse = message => {
+  if (!message.error && Number.isFinite(message.expiresAt) && Date.now() >= message.expiresAt) {
+    message = { ...message, result: undefined, error: { code: -32603,
+      message: 'Approval expired. The outcome is unknown; verify it before retrying.' } };
+  }
   const waiter = valueWaiters.get(message.id);
 
   if (waiter) {
@@ -188,7 +192,9 @@ const receiveResponse = message => {
     clearTimeout(timer);
     legacyInFlight.delete(message.id);
     const payload = message.error ? legacy.onError(message.error) : legacy.onSuccess(message.result);
-    decorateLegacyGrant(payload).then(postToPage);
+    decorateLegacyGrant(payload).then(value => postToPage(
+      !message.error && Number.isFinite(message.expiresAt) && Date.now() >= message.expiresAt
+        ? legacy.onError({ code: -32603, message: 'Approval expired. Verify the outcome before retrying.' }) : value));
     return false;
   }
 
@@ -198,6 +204,7 @@ const receiveResponse = message => {
     id: message.id,
     result: message.result,
     error: message.error,
+    expiresAt: message.expiresAt,
   });
   return false;
 };

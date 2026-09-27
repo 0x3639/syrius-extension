@@ -100,10 +100,12 @@ const readAttention = async () => {
 const writeAttention = state => chrome.storage.session.set({ [attentionKey]: state });
 // A successful human approval gives this origin one short follow-up opening,
 // including connect -> sign after the empty-window grace. Rejection gives none.
-const allowFollowup = origin => withWindow(async () => {
+const allowFollowup = (origin, expiresAt) => withWindow(async () => {
+  if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) return false;
   const state = await readAttention();
+  if (Date.now() >= expiresAt) return false;
   delete state.allowances[origin];
-  state.allowances[origin] = Date.now() + limits.originAttention;
+  state.allowances[origin] = Math.min(expiresAt, Date.now() + limits.originAttention);
   state.allowances = Object.fromEntries(Object.entries(state.allowances).slice(-limits.history));
   await writeAttention(state);
 });

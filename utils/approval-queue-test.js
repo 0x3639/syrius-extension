@@ -42,7 +42,7 @@ const message = 'Approval identity: defensive signing fixture.';
 const block = () => sdk.Primitives.AccountBlockTemplate.send(address, token, BigNumber.from(1)).toJson();
 const paramsFor = type => ({ connect: {}, sendTransaction: { to: address.toString(), tokenStandard: token.toString(), amount: '1' }, signAndSendBlock: block(), signMessage: { message } })[type];
 const entry = (responseId = 'same', documentId = 'doc-a', type = 'signMessage') => ({ responseId, documentId, origin: 'https://fixture.invalid', tabId: 1, frameId: 0, type, params: paramsFor(type), title: '', favicon: '' });
-const fixture = () => {
+const fixture = (requiredDifficulty = 0) => {
   let now = 1000000;
   const deadlineTimers = new Map();
   const schedule = (fn, ms) => {
@@ -56,7 +56,7 @@ const fixture = () => {
   };
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
   const session = {}, local = {}, locks = new Map(), listeners = {}, delivered = [], windows = new Map([[10, {}], [11, {}]]);
-  const faults = {}, counts = { created: 0, focused: 0, signs: 0, publishes: 0 }, events = [];
+  const faults = {}, counts = { created: 0, focused: 0, signs: 0, publishes: 0, workers: 0, terminated: 0 }, events = [];
   let storageGate, phaseGate, internalGate;
   const hold = phase => (phaseGate = { phase, started: deferred(), release: deferred() });
   const pause = async phase => { if (phaseGate?.phase === phase) { const held = phaseGate; phaseGate = null; held.started.resolve(); await held.release.promise; } };
@@ -67,9 +67,9 @@ const fixture = () => {
   const storage = (area, data) => ({
     get: async key => { await pause(area + 'Read'); if (faults[area + 'Read']) throw Error(area + ' read unavailable'); return Object.fromEntries((Array.isArray(key) ? key : [key]).map(k => [k, clone(data[k])])); },
     set: async values => {
-      if (storageGate?.area === area) { const held = storageGate; storageGate = null; held.started.resolve(); await held.release.promise; }
+      if (storageGate?.area === area && (!storageGate.key || Object.hasOwn(values, storageGate.key)) && --storageGate.remaining === 0) { const held = storageGate; storageGate = null; held.started.resolve(); await held.release.promise; }
       if (faults[area + 'Write']) throw Error(area + ' write unavailable');
-      Object.assign(data, clone(values));
+      Object.assign(data, clone(values)); await pause(area + 'Written');
     },
     remove: async keys => { if (faults[area + 'Write']) throw Error(area + ' write unavailable'); for (const key of Array.isArray(keys) ? keys : [keys]) delete data[key]; },
   });
@@ -87,7 +87,12 @@ const fixture = () => {
     tabs: { onRemoved: event('closedTab'), sendMessage: async (tabId, value, options) => { delivered.push({ tabId, value: clone(value), options: clone(options) }); } },
     alarms: { onAlarm: event('alarm'), create() {} },
   };
-  const environment = { Date: Clock, setTimeout: schedule, clearTimeout: cancel, chrome, navigator: { locks: locksApi }, crypto: crypto.webcrypto };
+  class PowWorker {
+    constructor() { counts.workers++; queueMicrotask(() => this.onmessage?.({ data: { ready: true } })); }
+    postMessage() { queueMicrotask(() => this.onmessage?.({ data: { nonce: '0000000000000001' } })); }
+    terminate() { counts.terminated++; }
+  }
+  const environment = { Worker: PowWorker, Date: Clock, setTimeout: schedule, clearTimeout: cancel, chrome, navigator: { locks: locksApi }, crypto: crypto.webcrypto };
   const load = loader(environment), queue = load('src/sections/Background/requests.js').default;
   const identity = load('src/services/utils/approvalIdentity.js');
   load('src/sections/Background/index.js');
@@ -111,7 +116,7 @@ const fixture = () => {
   const zenon = sdk.Zenon.getSingleton();
   zenon.ledger.getFrontierBlock = async () => { await pause('rpc'); return null; };
   zenon.ledger.getFrontierMomentum = async () => ({ hash: emptyHash, height: 1 });
-  zenon.embedded.plasma.getRequiredPoWForAccountBlock = async () => { await pause('pow'); return { requiredDifficulty: 0, basePlasma: 0, availablePlasma: 0 }; };
+  zenon.embedded.plasma.getRequiredPoWForAccountBlock = async () => { await pause('pow'); return { requiredDifficulty, basePlasma: 0, availablePlasma: 1 }; };
   sdk.utils.BlockUtils._setHashAndSignature = async (...args) => { const result = await sdkSetHashAndSignature(...args); await pause('readyToPublish'); return result; };
   zenon.ledger.publishRawTransaction = async template => { await pause('publish'); counts.publishes++; assert.equal(template.signature.length, 64); };
   const ui = (windowId = 10) => {
@@ -143,7 +148,7 @@ const fixture = () => {
   };
   const add = async value => { const request = await queue.add(value); await queue.attachWindow(identity.identityOf(request), 10); return queue.get(request.id); };
   return { queue, identity, add, load, fireDeadlines, now: () => now, advance: milliseconds => { now += milliseconds; }, freshQueue: () => loader(environment)('src/sections/Background/requests.js').default, session, local, faults, counts, events, windows, delivered, listeners, chrome, internal, sender, provider, hold, ui,
-    holdStorage: area => (storageGate = { area, started: deferred(), release: deferred() }),
+    holdStorage: (area, key, remaining = 1) => (storageGate = { area, key, remaining, started: deferred(), release: deferred() }),
     holdInternal: method => (internalGate = { method, started: deferred(), release: deferred() }) };
 };
 const watchdog = setTimeout(() => { console.error('Approval queue checks timed out'); process.exit(1); }, 45000);
@@ -248,7 +253,7 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     await fresh.closeWindow(first.windowId); assert(await fresh.get(unstamped.id));
     // Bounded old attention metadata is pruned during a later decision.
     f.session[f.queue.attentionKey].origins['https://stale.invalid'] = f.now() - limits.originAttention;
-    await f.queue.allowFollowup('https://follow.invalid');
+    await f.queue.allowFollowup('https://follow.invalid', f.now() + limits.ttl);
     assert.equal(f.session[f.queue.attentionKey].origins['https://stale.invalid'], undefined);
   }
   // Absolute expiry never refreshes older entries, and persisted claims lose
@@ -276,6 +281,38 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     f.listeners.closedTab(row.tabId); await flush(); assert.equal((await f.queue.list()).length, 0);
     assert.equal(await f.queue.claim(f.identity.identityOf(row), 10), null);
   }
+  // Finalization checks cover the actual awaited attention, permission read,
+  // durable grant and activation writes. A late attempt restores prior consent.
+  for (const phase of ['attention', 'read', 'grant', 'activation']) {
+    for (const previous of [null, { origin: 'https://fixture.invalid', title: 'Earlier consent', connectedAt: 1, lastUsedAt: 2 }]) {
+      const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
+      if (previous) f.local[permission.storageKey] = { [previous.origin]: previous };
+      const row = await f.add(entry('late-finalization-' + phase, 'doc-a', 'connect'));
+      const owner = await f.queue.claim(f.identity.identityOf(row), 10);
+      const held = phase === 'attention' ? f.holdStorage('session', f.queue.attentionKey)
+        : phase === 'read' ? f.hold('localRead') : phase === 'grant' ? f.holdStorage('local')
+          : f.holdStorage('session', 'syrius.permissionApprovals', 2);
+      const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
+      await held.started.promise; f.advance(limits.ttl); held.release.resolve();
+      assert.equal(await result, false); assert.equal(f.delivered.length, 1);
+      assert.equal(f.delivered[0].value.result, undefined); assert.equal(f.delivered[0].value.error.code, -32603);
+      assert.deepEqual(await permission.get(row.origin), previous);
+      assert.deepEqual(f.local[permission.storageKey]?.[row.origin] || null, previous);
+    }
+  }
+  // A failed local rollback retains an inactive, persisted guard across realms.
+  for (const previous of [null, { origin: 'https://fixture.invalid', title: 'Retained consent', connectedAt: 1 }]) {
+    const f = fixture(), permission = f.load('src/sections/Background/permissions.js').default;
+    if (previous) f.local[permission.storageKey] = { [previous.origin]: previous };
+    const row = await f.add(entry('rollback-unavailable', 'doc-a', 'connect'));
+    const owner = await f.queue.claim(f.identity.identityOf(row), 10), held = f.hold('localWritten');
+    const result = f.internal('approvals.resolve', { identity: owner, result: [address.toString()] });
+    await held.started.promise; f.advance(limits.ttl); f.faults.localWrite = true; held.release.resolve();
+    assert.equal(await result, false); assert.deepEqual(await permission.get(row.origin), previous);
+    const fresh = loader({ chrome: f.chrome, navigator: { locks: { request: async (name, fn) => fn() } } })('src/sections/Background/permissions.js').default;
+    assert.deepEqual(await fresh.get(row.origin), previous);
+    f.faults.localWrite = false; await permission.revoke(row.origin); assert.equal(await fresh.isConnected(row.origin), false);
+  }
   // Work is bounded synchronously even while the first storage read is held.
   {
     const f = fixture(), gate = deferred(), realGet = f.chrome.storage.session.get;
@@ -299,6 +336,14 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     const copied = stale.button(label[type]).props.onClick; expired.advance(limits.ttl); await copied();
     assert.equal(expired.counts.signs, 0); assert.equal(expired.counts.publishes, 0);
     await expired.queue.prune(); assert.equal(expired.delivered[0].value.error.code, -32006); stale.dispose();
+  }
+  // Nonzero PoW follows the same actual SDK preparation/signature path, with
+  // inert worker output and publication; native WASM compatibility is separate.
+  {
+    const f = fixture(1); await f.add(entry('nonzero-pow', 'doc-a', 'sendTransaction'));
+    const view = f.ui(); await view.settle(); await view.button('Confirm').props.onClick();
+    assert.equal(f.delivered[0].value.error, undefined); assert.equal(f.counts.signs, 1);
+    assert.equal(f.counts.publishes, 1); assert.equal(f.counts.workers, 1); assert.equal(f.counts.terminated, 1); view.dispose();
   }
   for (const type of ['sendTransaction', 'signAndSendBlock', 'signMessage']) {
     for (const phase of type === 'signMessage' ? ['key', 'sign'] : ['key', 'rpc', 'pow', 'sign', 'readyToPublish']) {
@@ -351,6 +396,13 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     const transaction = callbacks.shift(); transaction.callback({ accepted: true });
     handlers.background({ channel: 'znn', kind: 'response', id: transaction.value.id, result: { hash: 'fixture' } });
     await flush(); assert.deepEqual(posted.at(-1), { method: 'znn.signedTransaction', data: { hash: 'fixture' } });
+    page({ target: 'znn-contentscript', kind: 'request', id: 'late-relay', method: 'znn_connect', params: {} });
+    callbacks.shift().callback({ accepted: true });
+    handlers.background({ channel: 'znn', kind: 'response', id: 'late-relay', result: [address.toString()], expiresAt: Date.now() - 1 });
+    assert.equal(posted.at(-1).result, undefined); assert.equal(posted.at(-1).error.code, -32603);
+    page({ method: 'znn.requestWalletAccess' }); const expiredLegacy = callbacks.shift(); expiredLegacy.callback({ accepted: true });
+    handlers.background({ channel: 'znn', kind: 'response', id: expiredLegacy.value.id, result: [address.toString()], expiresAt: Date.now() - 1 });
+    await flush(); assert.equal(posted.at(-1).method, 'znn.deniedWalletRead');
     page({ method: 'znn.requestWalletAccess' }); const timeout = callbacks.shift(); timeout.callback({ accepted: true });
     const timer = [...timers.values()].find(x => x.ms === limits.ttl + 60000); timer.fn();
     assert.match(posted.at(-1).error, /Verify the outcome/); timers.clear();
@@ -358,5 +410,15 @@ const watchdog = setTimeout(() => { console.error('Approval queue checks timed o
     assert.equal(timers.size, limits.activeHandlers); assert.equal(posted.at(-1).method, 'znn.deniedWalletRead');
     timers.clear();
   }
-  console.log('approval queue: bounded JSON/capacity/transient work; storage/window failures; persistent attention; absolute expiry; actual worker/relay/UI/SDK legitimate and delayed controls passed');
+  // The MAIN-world receiver independently rejects a transport-delayed result.
+  {
+    const handlers = {}, posted = [];
+    const window = { location: { origin: 'https://fixture.invalid' }, dispatchEvent() {},
+      addEventListener: (name, fn) => { handlers[name] = fn; }, postMessage: value => posted.push(value) };
+    loader({ window })('src/sections/Inpage/index.js');
+    const response = window.zenon.connect().then(value => ({ value }), error => ({ error }));
+    handlers.message({ source: window, data: { target: 'znn-inpage', kind: 'response', id: posted[0].id, result: [address.toString()], expiresAt: Date.now() - 1 } });
+    assert.equal((await response).error.code, -32603); assert.deepEqual(window.zenon.accounts, []);
+  }
+  console.log('approval queue: bounded JSON/capacity/transient work; storage/window failures; persistent attention; absolute expiry including delayed finalization and failed rollback; actual worker/relay/UI/SDK legitimate and delayed controls passed');
 })().catch(error => { console.error(error.stack || String(error)); process.exitCode = 1; }).finally(() => clearTimeout(watchdog));

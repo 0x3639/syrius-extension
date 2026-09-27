@@ -110,7 +110,7 @@ const sendToTab = async (tabId, message, frameId, documentId) => {
 
 const respond = (target, id, result, error) => {
   if (typeof target.documentId !== 'string' || !target.documentId) return false;
-  return sendToTab(target.tabId, { channel: 'znn', kind: 'response', id, result, error }, target.frameId, target.documentId);
+  return sendToTab(target.tabId, { channel: 'znn', kind: 'response', id, result, error, expiresAt: target.expiresAt }, target.frameId, target.documentId);
 };
 
 requests.onExpired(removed => Promise.all(removed.map(request =>
@@ -292,26 +292,29 @@ const internalMethods = {
   'approvals.resolve': async ({ identity, result }) => {
     const request = await requests.resolve(identity);
     if (!request) return false;
-    if (request.expiresAt <= Date.now()) {
-      await respond(request, request.responseId, undefined, errors.expiredClaim);
+    const checkDeadline = () => {
+      if (Date.now() >= request.expiresAt) throw new Error('Approval expired during finalization.');
+    };
+    let delivery;
+    const complete = () => { checkDeadline(); delivery = respond(request, request.responseId, result); };
+    try {
+      checkDeadline();
+      // Save this optional convenience before permission activation. A held
+      // window lock or storage write must not leave a new grant behind.
+      try { await requests.allowFollowup(request.origin, request.expiresAt); }
+      catch (error) { console.error('Unable to save approval follow-up allowance', error); }
+      checkDeadline();
+      if (request.type === 'connect') {
+        if (!(await permissions.grant(request.origin, { title: request.title, favicon: request.favicon },
+          { expiresAt: request.expiresAt, complete }))) throw new Error('The connection permission could not be saved.');
+      } else complete();
+      await delivery;
+      return true;
+    } catch (error) {
+      await respond(request, request.responseId, undefined, Date.now() >= request.expiresAt
+        ? errors.expiredClaim : { ...errors.internal, message: error.message });
       return false;
     }
-    if (request.type === 'connect') {
-      try {
-        if (!(await permissions.grant(request.origin, { title: request.title, favicon: request.favicon }))) {
-          throw new Error('The connection permission could not be saved.');
-        }
-      } catch (error) {
-        await respond(request, request.responseId, undefined, { ...errors.internal, message: error.message });
-        return false;
-      }
-    }
-    // A completed user approval permits one immediate follow-up window. Failure
-    // to persist that convenience never converts a completed effect into a retry.
-    try { await requests.allowFollowup(request.origin); }
-    catch (error) { console.error('Unable to save approval follow-up allowance', error); }
-    await respond(request, request.responseId, result);
-    return true;
   },
   'approvals.reject': async ({ identity, error }) => {
     const request = await requests.reject(identity);

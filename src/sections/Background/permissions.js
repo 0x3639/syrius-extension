@@ -7,7 +7,7 @@
 // could ask.
 //
 // A connection here is read access to the selected address, the chain
-// identifier and the node URL, granted per origin and remembered. It is never
+// identifier and the public node host, granted per origin and remembered. It is never
 // permission to move anything: signing and sending are prompted every time,
 // the way they are in every wallet a person is likely to have used.
 

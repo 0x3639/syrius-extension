@@ -37,6 +37,8 @@ notes behind it are in [REFACTOR.md](REFACTOR.md).
 
 ## Installation
 
+Requires Chrome/Chromium 111 or later for document-bound provider events.
+
 ### From a release
 
 Every `v*.*.*` tag is built by GitHub Actions and published as a Chrome/Brave
@@ -230,6 +232,11 @@ grant fields expose only the WebSocket scheme, host and nondefault port. URL
 credentials, paths, query strings and fragments remain private. This public
 descriptor may not be a usable connection endpoint; the wallet keeps the full
 configured URL for its own SDK connection and reconnect fallback.
+
+Failed disconnections remain visible in Connected Sites for retry. Treat an
+error as incomplete and retry until the site is removed. A saved session denial
+blocks access while a failed durable removal is pending; it is not a substitute
+for completing that removal before restarting the browser.
 
 Errors follow EIP-1193 numbering: `4001` the person declined, `4100` the origin
 is not connected, `4200` unknown method, `4900` the wallet is locked, `-32602`

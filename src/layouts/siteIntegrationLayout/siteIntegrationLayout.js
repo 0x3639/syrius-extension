@@ -224,7 +224,9 @@ const SiteIntegrationLayout = () => {
   }, [request]);
 
   const finish = async (id, result, grantOrigin = false) => {
-    await sendInternal('approvals.resolve', { id, result, grantOrigin });
+    if (!(await sendInternal('approvals.resolve', { id, result, grantOrigin }))) {
+      throw new Error('The approval could not be completed.');
+    }
     await loadNext();
   };
 
@@ -243,6 +245,9 @@ const SiteIntegrationLayout = () => {
     setIsBusy(true);
     try {
       await finish(request.id, [address], true);
+    } catch (error) {
+      notify.error(error);
+      await loadNext();
     } finally {
       setIsBusy(false);
     }

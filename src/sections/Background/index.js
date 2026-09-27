@@ -99,9 +99,9 @@ const getConnectedPublicState = async origin => {
 //
 // Talking back to pages
 //
-const sendToTab = async (tabId, message, frameId) => {
+const sendToTab = async (tabId, message, frameId, documentId) => {
   try {
-    await chrome.tabs.sendMessage(tabId, message, frameId === undefined ? {} : { frameId });
+    await chrome.tabs.sendMessage(tabId, message, { ...(frameId === undefined ? {} : { frameId }), ...(documentId ? { documentId } : {}) });
   } catch (err) {
     // The tab navigated away or closed. Nothing to deliver to and nothing to
     // do about it.
@@ -126,7 +126,7 @@ const broadcast = async (event, data) => {
     targets.map(async frame => {
       // The initial list can become stale while the frame registry is read.
       if (await permissions.isConnected(frame.origin)) {
-        await sendToTab(frame.tabId, { channel: 'znn', kind: 'event', event, data }, frame.frameId);
+        await sendToTab(frame.tabId, { channel: 'znn', kind: 'event', event, data }, frame.frameId, frame.documentId);
       }
     })
   );
@@ -177,8 +177,7 @@ const providerMethods = {
   znn_connect: async ({ id, origin, target, sender }) => {
     const state = await getPublicState();
 
-    if ((await permissions.isConnected(origin)) && state?.address) {
-      await permissions.touch(origin);
+    if (state?.address && await permissions.touch(origin)) {
       return { settled: true, result: [state.address] };
     }
     await queueApproval('connect', { id, target, origin, sender });
@@ -287,7 +286,16 @@ const internalMethods = {
       return false;
     }
     if (grantOrigin) {
-      await permissions.grant(request.origin, { title: request.title, favicon: request.favicon });
+      try {
+        if (!(await permissions.grant(request.origin, { title: request.title, favicon: request.favicon }))) {
+          throw new Error('The connection permission could not be saved.');
+        }
+      } catch (error) {
+        // The queue row has already been removed: answer its original caller
+        // with the failed grant rather than leaving its connection pending.
+        await respond(request, id, undefined, { ...errors.internal, message: error.message });
+        return false;
+      }
     }
     await respond(request, id, result);
     return true;

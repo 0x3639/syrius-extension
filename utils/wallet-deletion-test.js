@@ -16,7 +16,7 @@ const fixtureAddress = (seed, index) => new sdkReal.Primitives.Address('z', Buff
 const fixture = () => {
   const disk = new Map(), seeds = new Map(), writes = [], waits = new Map(), notices = [], navigations = [], events = [];
   const state = { wallet: { walletName: 'A', maxAddressIndex: 3, selectedAddressIndex: 0 } };
-  let fault = null, hooks = React, passwordReads = 0;
+  let fault = null, hooks = React, passwordReads = 0, onDerive = () => {};
   const hold = name => { const gate = { started: deferred(), release: deferred() }; waits.set(name, gate); return gate; };
   const pause = async name => { const gate = waits.get(name); if (gate) { waits.delete(name); gate.started.resolve(); await gate.release.promise; } };
   const localStorage = { getItem: key => { if (fault === 'get:' + key) { fault = null; throw Error('read failed'); } return disk.get(key) ?? null; },
@@ -24,7 +24,7 @@ const fixture = () => {
     removeItem: key => { writes.push(['remove', key]); if (fault === key) { fault = null; throw Error('write failed'); } disk.delete(key); } };
   const sdk = { ...sdkReal, KeyStore: class {
     fromEntropy(seed) { this.entropy = seed; return this; }
-    getKeyPair(index) { const seed = this.entropy; return { getAddress: async () => { await pause('derive:' + index); if (fault === 'derive') { fault = null; throw Error('derive failed'); } return fixtureAddress(seed, index); } }; }
+    getKeyPair(index) { const seed = this.entropy; return { getAddress: async () => { await pause('derive:' + index); if (fault === 'derive') { fault = null; throw Error('derive failed'); } onDerive(index); return fixtureAddress(seed, index); } }; }
   }, KeyStoreManager: function () { return {
     readKeyStore: async (password, name) => { passwordReads++; await pause('password'); if (password !== 'fixture' || !Object.hasOwn(JSON.parse(disk.get(W) || '{}'), name)) throw Error('Error decrypting'); return new sdk.KeyStore().fromEntropy(seeds.get(name)); },
     listAllKeyStores: () => JSON.parse(disk.get(W) || '{}'),
@@ -41,6 +41,9 @@ const fixture = () => {
       if (id === 'react-redux') return { useSelector: fn => fn(state), useStore: () => ({ getState: () => state }), useDispatch: () => action => events.push(action.type) };
       if (id.endsWith('/utils/notify')) return { notify: { success: value => notices.push({ success: value }), error: error => notices.push({ error: String(error) }) } };
       if (id.endsWith('/hooks/useAccount')) return { invalidateAccountCache: () => events.push('cache cleared') };
+      if (id.endsWith('/components/change-address-item/change-address-item')) return { __esModule: true, default: 'address-item' };
+      if (id.endsWith('/wallet/session')) return { __esModule: true, default: { touch: async () => {} } };
+      if (id.endsWith('/wallet/announce')) return { announceAddress: async () => {} };
       if (id.endsWith('/wallet/lock')) return { __esModule: true, default: async () => { events.push('lock'); vault.lock(); await pause('lock'); } };
       if (!id.startsWith('.')) return require(id);
       const target = path.resolve(path.dirname(filename), id); return load(path.extname(target) ? target : target + '.js');
@@ -63,14 +66,15 @@ const fixture = () => {
   };
   const capture = () => { const before = { ...state.wallet }; return api.captureWalletRemoval(before, () => Object.keys(before).every(key => before[key] === state.wallet[key])); };
   const remove = async () => api.commitWalletRemoval(await api.prepareWalletRemoval(capture()));
-  const ui = () => {
+  const ui = (file = 'src/pages/settings/reset-wallet/reset-wallet.js') => {
     const values = [], refs = [], effects = []; let cursor, refCursor, effectCursor, tree;
     hooks = { ...React,
+      useCallback: fn => fn,
       useState: initial => { const i = cursor++; if (!(i in values)) values[i] = typeof initial === 'function' ? initial() : initial; return [values[i], value => { values[i] = value; }]; },
       useRef: initial => refs[refCursor++] ||= { current: initial },
       useEffect: fn => { const i = effectCursor++; if (!effects[i]) effects[i] = { fn }; },
     };
-    const Component = load('src/pages/settings/reset-wallet/reset-wallet.js').default;
+    const Component = load(file).default;
     const render = () => { cursor = refCursor = effectCursor = 0; tree = Component(); for (const effect of effects) if (!effect.ran) { effect.ran = true; effect.cleanup = effect.fn(); } };
     const flatten = node => !node || typeof node !== 'object' ? [] : Array.isArray(node) ? node.flatMap(flatten) : [node, ...flatten(node.props?.children)];
     const find = fn => flatten(tree).find(fn);
@@ -87,6 +91,7 @@ const fixture = () => {
   for (const key of ['nodeList', 'currentNodeUrl', 'syrius.settings', 'znn.ts-chainId']) disk.set(key, 'unchanged ' + key);
   return { disk, state, writes, notices, navigations, events, vault, api, sdk, read, put, add, activate, capture, remove, hold, ui,
     storage: load('src/services/utils/storage.js'),
+    onDerive: fn => { onDerive = fn; },
     fail: key => { fault = key; }, passwordReads: () => passwordReads, snapshot: () => [...disk.entries()] };
 };
 const watchdog = setTimeout(() => { console.error('Wallet deletion checks timed out'); process.exit(1); }, 45000);
@@ -163,6 +168,22 @@ const watchdog = setTimeout(() => { console.error('Wallet deletion checks timed 
     assert.equal(f.storage.setAddressInfo('A', { selectedAddressIndex: 0, maxAddressIndex: 1 }), false); assert.equal(f.disk.get(I), before);
     await assert.rejects(f.remove(), /metadata/); assert.equal(f.writes.length, 0);
   }
+  for (const failed of [false, true]) {
+    const f = fixture(), ui = f.ui('src/pages/settings/change-address/change-address.js');
+    await new Promise(resolve => setImmediate(resolve)); ui.render(); assert.equal(ui.button('Add address').props.disabled, false);
+    if (failed) f.fail(I);
+    ui.button('Add address').props.onClick();
+    assert.equal(f.read(I).A.maxAddressIndex, failed ? 3 : 4);
+    assert.equal(f.events.includes('wallet/storeMaxAddressIndex'), !failed);
+    assert.equal(f.notices.some(x => x.error?.includes('Could not save the new address')), failed);
+    // A failed addition leaves no new account available to label. Reload and
+    // deletion still cover every address that was exposed by the account list.
+    if (failed) {
+      ui.render(); assert.equal(ui.find(node => node.type === 'address-item' && node.props.index === 3), undefined);
+      f.activate('A', f.storage.getAddressInfo('A').maxAddressIndex); await f.remove();
+      assert.equal(f.read(L)[fixtureAddress('A', 2)], undefined);
+    }
+  }
   {
     const f = fixture(), prepared = await f.api.prepareWalletRemoval(f.capture()); f.add('late duplicate', 'A', 1); const before = f.snapshot();
     assert.throws(() => f.api.commitWalletRemoval(prepared), /changed/); assert.deepEqual(f.snapshot(), before); assert.equal(f.writes.length, 0);
@@ -215,6 +236,16 @@ const watchdog = setTimeout(() => { console.error('Wallet deletion checks timed 
     if (action === 'count') f.state.wallet = { ...f.state.wallet, maxAddressIndex: 4 };
     if (action === 'aba') { f.activate('B'); f.activate('A'); }
     const before = f.snapshot(); gate.release.resolve(); await removing; assert.deepEqual(f.snapshot(), before); assert.equal(f.writes.length, 0); assert.equal(f.notices.some(x => x.success), false);
+  }
+  {
+    // A real event-loop task must get a chance to cancel a long inventory, even
+    // when every address promise resolves without an I/O pause as in the SDK.
+    const f = fixture(); f.add('A', 'A', 33); f.activate('A', 33); const ui = f.ui(); ui.fill();
+    let derived = 0, canceled = false;
+    f.onDerive(index => { derived++; if (index === 1) setTimeout(() => { canceled = true; ui.button('Cancel').props.onClick(); }, 0); });
+    const before = f.snapshot(); await ui.button('Remove').props.onClick();
+    assert.equal(canceled, true); assert(derived > 1 && derived < 33); assert.deepEqual(f.snapshot(), before);
+    assert.equal(f.writes.length, 0); assert.equal(f.notices.some(x => x.success), false);
   }
   {
     const f = fixture(), ui = f.ui(); ui.fill(); const callback = ui.button('Remove').props.onClick, gate = f.hold('password');

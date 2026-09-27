@@ -73,6 +73,10 @@ const prepareWalletRemoval = async (captured) => {
   const count = captured.lastWallet || captured.sharedNames.length ? 1 : captured.count;
   for (let index = 0; index < count; index += 1) {
     assertCurrent(captured);
+    // The pinned SDK resolves its derivation promises synchronously. Yield a
+    // browser task between small batches so Cancel/navigation can actually run.
+    if (index % 16 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    assertCurrent(captured);
     // Do not use vault.getAddress(): its base implementation writes an async
     // cache after derivation and could contaminate a replacement vault.
     const pair = vault.getKeyPair(index);

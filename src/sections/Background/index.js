@@ -30,7 +30,7 @@ const maxSignMessageLength = 8192;
 //
 const errors = {
   userRejected: { code: 4001, message: 'User rejected the request' },
-  approvalInterrupted: { code: -32603, message: 'Approval window closed after approval began. The outcome is unknown; verify the result before retrying.' },
+  approvalInterrupted: { code: -32603, message: 'Approval was interrupted after it began. The outcome is unknown; check the original account before retrying.' },
   unauthorized: { code: 4100, message: 'The site is not connected to this wallet' },
   unsupportedMethod: { code: 4200, message: 'Unsupported method' },
   disconnected: { code: 4900, message: 'The wallet is locked' },
@@ -105,7 +105,8 @@ const announceToSites = async (stored, event, expectedId, clearOrigins = []) => 
   }));
   return true;
 };
-const rejectRemoved = removed => Promise.all(removed.map(request => respond(request, request.responseId, undefined, errors.userRejected)));
+const rejectRemoved = removed => Promise.all(removed.map(request => respond(request, request.responseId, undefined,
+  request.claimId ? errors.approvalInterrupted : errors.userRejected)));
 const revokeOrigin = async (stored, origin, scope) => {
   await permissions.revoke(origin, scope);
   await rejectRemoved(await requests.cancelWhere(request => request.origin === origin &&

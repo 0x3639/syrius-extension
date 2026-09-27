@@ -245,7 +245,7 @@ const SiteIntegrationLayout = () => {
   const approve = async (execute, success) => {
     const selected = { request, address, chainIdentifier, nodeUrl, binding: vault.getBinding() };
     if (operation.current || !currentView(selected)) return;
-    const active = { kind: 'approval', selected, identity: identityOf(request), claimed: false };
+    const active = { kind: 'approval', selected, identity: identityOf(request), claimed: false, submitted: false };
     operation.current = active;
     setIsBusy(true);
     const localCurrent = () => operation.current === active && currentView(selected);
@@ -261,17 +261,21 @@ const SiteIntegrationLayout = () => {
       active.identity = claim;
       active.claimed = true;
       await assertRequest();
-      const result = await execute(selected.request, assertRequest, selected.binding);
+      const result = await execute(selected.request, assertRequest, selected.binding, () => { active.submitted = true; });
       await assertRequest();
       if (!(await sendInternal('approvals.resolve', { identity: active.identity, result }))) throw approvalEnded();
       if (success) notify.success(success);
     } catch (error) {
-      notify.error(error);
+      // Selection/permission may change after publication starts, including
+      // between the SDK returning and the worker settling this request.
+      const reported = active.submitted
+        ? new Error('The transaction may have been submitted. Its outcome is unknown. Check the original account before retrying.') : error;
+      notify.error(reported);
       // Unclaimed stale requests can be retired too. The queue refuses an
       // unclaimed identity if another popup owns it, preserving the winner.
       try {
         await sendInternal('approvals.reject', { identity: active.identity,
-          error: { code: -32603, message: readableError(error) } });
+          error: { code: -32603, message: readableError(reported) } });
       } catch (cleanupError) { notify.error(cleanupError); }
     } finally {
       if (operation.current === active) {
@@ -304,16 +308,16 @@ const SiteIntegrationLayout = () => {
   const tokenFor = tokenStandard => balanceMap[tokenStandard];
   const approveConnect = () => approve(async () => [address]);
   const blockResult = signed => ({ hash: signed.hash?.toString(), block: signed.toJson?.() ?? null });
-  const approveSendTransaction = () => approve(async (selected, assertRequest, binding) => {
+  const approveSendTransaction = () => approve(async (selected, assertRequest, binding, onSubmitted) => {
     const { to, tokenStandard, amount } = selected.params;
     const template = Primitives.AccountBlockTemplate.send(Primitives.Address.parse(to), Primitives.TokenStandard.parse(tokenStandard), amount);
-    return blockResult(await send(template, { assertRequest, binding, addressIndex: binding.scope.index }));
+    return blockResult(await send(template, { assertRequest, binding, onSubmitted, addressIndex: binding.scope.index }));
   }, 'Transaction sent');
   const approveSignMessage = () => approve((selected, assertRequest, binding) =>
     signMessage(selected.params.message, { assertRequest, binding, addressIndex: binding.scope.index }), 'Message signed');
-  const approveSignAndSend = () => approve(async (selected, assertRequest, binding) => {
+  const approveSignAndSend = () => approve(async (selected, assertRequest, binding, onSubmitted) => {
     const template = Primitives.AccountBlockTemplate.fromJson(selected.params);
-    return blockResult(await send(template, { assertRequest, binding, addressIndex: binding.scope.index }));
+    return blockResult(await send(template, { assertRequest, binding, onSubmitted, addressIndex: binding.scope.index }));
   }, 'Block sent');
 
   if (request === undefined) {

@@ -29,8 +29,9 @@ const useBlockSender = () => {
   const [isSending, setIsSending] = useState(false);
   const [isGeneratingPlasma, setIsGeneratingPlasma] = useState(false);
 
-  const send = useCallback(async (template, { addressIndex, assertRequest, binding } = {}) => {
+  const send = useCallback(async (template, { addressIndex, assertRequest, binding, onSubmitted } = {}) => {
     const zenon = Zenon.getSingleton();
+    let submitted = false;
     await assertRequest?.();
     const keyPair = requestSigningKey(await vault.getSigningKeyPair(addressIndex), assertRequest, binding);
     await assertRequest?.();
@@ -45,7 +46,13 @@ const useBlockSender = () => {
           if (binding && block.address?.toString() !== binding.scope.address) throw new Error('The signing account changed.');
           // Begin the actual RPC while selection is locked; do not hold the
           // lock waiting on a remote node. A submitted block cannot be undone.
-          return { promise: zenon.ledger.publishRawTransaction(block) };
+          submitted = true;
+          onSubmitted?.();
+          const promise = Promise.resolve(zenon.ledger.publishRawTransaction(block));
+          // A later scope check can stop awaiting the reply. Keep that
+          // response rejection handled while preserving it for its waiter.
+          promise.catch(() => {});
+          return { promise };
         });
         return started.promise;
       };
@@ -64,6 +71,9 @@ const useBlockSender = () => {
       invalidateAccountCache();
       await assertRequest?.();
       return signed;
+    } catch (error) {
+      if (submitted) throw new Error('The transaction may have been submitted. Its outcome is unknown. Check the original account before retrying.');
+      throw error;
     } finally {
       // In `finally`, so an error cannot leave the screen saying it is working.
       setIsGeneratingPlasma(false);

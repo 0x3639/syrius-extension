@@ -58,11 +58,14 @@ const withdraw = predicate => serialized(async entries => {
 const revoke = (origin, scope) => withdraw(entry => entry.origin === origin && (!scope || selection.sameScope(entry.scope, scope)));
 const revokeAll = () => withdraw(() => true);
 const revokeWallet = scope => withdraw(entry => selection.sameWallet(entry.scope, scope));
+// Cleanup needs every durable target, including a grant conservatively denied
+// in this document. Another worker realm may have reconnected it meanwhile.
+const forWallet = scope => serialized(entries => entries.filter(entry => selection.sameWallet(entry.scope, scope)));
 const touch = (origin, scope) => serialized(async entries => {
   if (!(await connected(entries, origin, scope))) return false;
   find(entries, origin, scope).lastUsedAt = Date.now();
   await writeAll(entries);
   return true;
 });
-const permissions = { storageKey, originOf, isConnected, list, grant, revoke, revokeAll, revokeWallet, touch };
+const permissions = { storageKey, originOf, isConnected, list, grant, revoke, revokeAll, revokeWallet, forWallet, touch };
 export default permissions;

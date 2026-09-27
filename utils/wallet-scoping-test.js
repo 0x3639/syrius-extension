@@ -94,9 +94,12 @@ const fixture = () => {
   const sessionApi = load('src/services/wallet/session.js').default;
   load('src/sections/Background/index.js');
   const sender = (origin = 'https://fixture.invalid') => ({ id: 'fixture', origin, url: origin + '/app', tab: { id: 1 }, frameId: 0, documentId: 'doc-one' });
-  const internal = (method, params = {}) => new Promise((resolve, reject) => {
+  const internal = async (method, params = {}) => {
+    await pause('internal:' + method);
+    return new Promise((resolve, reject) => {
     listeners.message({ channel: 'internal', method, params }, { id: 'fixture', url: 'chrome-extension://fixture/popup.html' }, response => response.error ? reject(Error(response.error)) : resolve(response.result));
   });
+  };
   chrome.runtime.sendMessage = (message, callback) => internal(message.method, message.params).then(result => callback({ result }), error => callback({ error: error.message }));
   let responseId = 0;
   const provider = async (method, params, origin) => {
@@ -329,6 +332,42 @@ const watchdog = setTimeout(() => { console.error('Wallet scoping checks timed o
     assert.equal(f.calls.sign, phase === 'sdkBeforeKey' ? 0 : 1);
     await copied(); assert.equal(f.calls.publish, 0); ui.dispose();
   }
+  {
+    const f = fixture(); await f.activate(); await f.register(origin);
+    await f.permissions.grant(origin, f.scope()); await f.permissions.revokeWallet(f.scope());
+    // A fresh worker grants again; the removing popup still conservatively
+    // denies its earlier local grant. Cleanup must nevertheless target it.
+    const fresh = loader(f.env)('src/sections/Background/permissions.js').default;
+    await fresh.grant(origin, f.scope());
+    f.disk.set('znn.ts-wallet', JSON.stringify({ A: { encrypted: 'fixture' } }));
+    await f.load('src/services/wallet/removeWallet.js').default(f.vault.getBinding(), 'A');
+    const cleared = f.messages.filter(item => item.message.kind === 'event').at(-1);
+    assert.deepEqual(cleared.message.data, []);
+    assert.equal(await fresh.isConnected(origin, f.scope()), false);
+  }
+  // Once publication starts, account changes, expiry, revocation and final
+  // response races must never describe the operation as safely rejected.
+  for (const method of ['znn_sendTransaction', 'znn_signAndSendBlock']) {
+    for (const change of ['selection', 'expiry', 'revoke', 'resolve']) {
+      const f = fixture(); await f.activate(); await f.permissions.grant(origin, f.scope());
+      await f.provider(method, { to: 'fixture-recipient', toAddress: 'fixture-recipient', tokenStandard: 'fixture-token', amount: '0' });
+      const ui = f.ui(); await ui.settle();
+      const gate = f.hold(change === 'resolve' ? 'internal:approvals.resolve' : 'publish');
+      const pending = ui.button(method === 'znn_sendTransaction' ? 'Confirm' : 'Sign and send').props.onClick();
+      await gate.started.promise; assert.equal(f.calls.publish, 1);
+      if (change === 'expiry') f.advance(900001);
+      else if (change === 'revoke') await f.internal('permissions.revoke', { origin });
+      else { await f.activate('B'); await f.activate('A'); }
+      gate.release.resolve(); await pending;
+      const replies = f.messages.filter(item => item.message.kind === 'response');
+      assert.equal(replies.length, 1);
+      assert.match(replies[0].message.error.message, /outcome is unknown/);
+      assert.match(replies[0].message.error.message, /before retrying/);
+      assert.notEqual(replies[0].message.error.code, 4001);
+      assert.ok(ui.notices.some(value => /outcome is unknown/.test(value.error)));
+      assert.equal(f.calls.publish, 1); ui.dispose();
+    }
+  }
   // The direct predecessor remains attached to the same timed selection
   // across popup restores, including requests not yet displayed.
   {
@@ -369,7 +408,7 @@ const watchdog = setTimeout(() => { console.error('Wallet scoping checks timed o
     const testStore = new realSdk.KeyStore().fromEntropy('00'.repeat(32));
     const first = (await testStore.getKeyPair(0).getAddress()).toString();
     const selected = (await testStore.getKeyPair(1).getAddress()).toString();
-    for (const phase of ['control', 'sdkBeforeSignature', 'sdkBeforePublish']) {
+    for (const phase of ['control', 'sdkBeforeSignature', 'sdkBeforePublish', 'sdkPublicationReply']) {
       const f = fixture(); Object.assign(f.sdk, realSdk);
       const scope = { walletName: 'public-unit-fixture', walletId: first, address: selected, index: 1 };
       const record = { id: crypto.randomUUID(), scope, walletName: scope.walletName, mode: 'timed', expiresAt: 1900000, ownerId: 'fixture', entropy: 'fixture-only' };
@@ -381,6 +420,7 @@ const watchdog = setTimeout(() => { console.error('Wallet scoping checks timed o
       zenon.embedded.plasma.getRequiredPoWForAccountBlock = async () => ({ requiredDifficulty: 0, basePlasma: 0, availablePlasma: 1 });
       zenon.ledger.publishRawTransaction = async template => {
         f.calls.publish++; assert.equal(template.address.toString(), selected); assert.equal(template.signature.length, 64);
+        await f.pause('sdkPublicationReply');
       };
       realSdk.utils.BlockUtils._setHashAndSignature = async (...args) => {
         await f.pause('sdkBeforeSignature'); const signed = await actualSetSignature(...args);
@@ -395,7 +435,8 @@ const watchdog = setTimeout(() => { console.error('Wallet scoping checks timed o
         await f.selection.transaction(stored => f.selection.revoke(f.selection.current(stored)));
         f.vault.lock(); gate.release.resolve();
       }
-      await sending; assert.equal(f.calls.publish, phase === 'control' ? 1 : 0, JSON.stringify(ui.notices));
+      await sending; assert.equal(f.calls.publish, ['control', 'sdkPublicationReply'].includes(phase) ? 1 : 0, JSON.stringify(ui.notices));
+      if (phase === 'sdkPublicationReply') assert.ok(ui.notices.some(value => /outcome is unknown/.test(value.error)));
       if (phase === 'control') assert.equal(ui.notices.filter(value => value.error).length, 0, JSON.stringify(ui.notices));
       ui.dispose();
     }

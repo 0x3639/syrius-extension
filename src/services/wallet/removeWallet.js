@@ -12,7 +12,7 @@ const removeWallet = async (binding, walletName) => {
       selection.assert(selection.current(stored), binding, true);
       vault.assertBinding(binding);
       if (walletName !== binding.scope.walletName) throw selection.ended();
-      const sites = (await permissions.list()).filter(site => selection.sameWallet(site.scope, binding.scope));
+      const sites = await permissions.forWallet(binding.scope);
       update = { selectionId: binding.id, origins: sites.map(site => site.origin), cancelled: [] };
       await permissions.revokeWallet(binding.scope);
       // Also remove unbound connects: an old consent prompt must not survive

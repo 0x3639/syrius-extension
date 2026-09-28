@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 
 import { notify } from '../../../services/utils/notify';
-import fallbackValues from '../../../services/utils/fallbackValues';
+import { validateWalletPassword, saveWalletWithPassword } from '../../../services/wallet/password';
 import vault from '../../../services/wallet/vault';
 
 // Changing the wallet password.
@@ -30,16 +30,8 @@ const ChangePassword = () => {
     handleSubmit,
     formState: { errors },
     setError,
+    setValue,
   } = useForm({ mode: 'onSubmit' });
-
-  const { strongRegex, mediumRegex } = fallbackValues.passwordValidationInfo;
-
-  const validateNewPassword = (value) => {
-    if (!strongRegex.test(value) && !mediumRegex.test(value)) {
-      return 'Use at least 8 characters with upper case, lower case and a digit';
-    }
-    return true;
-  };
 
   const save = async () => {
     setIsSaving(true);
@@ -75,7 +67,10 @@ const ChangePassword = () => {
             placeholder="Current password"
             type="password"
             value={currentPassword}
-            onChange={(event) => setCurrentPassword(event.target.value)}
+            onChange={(event) => {
+              setCurrentPassword(event.target.value);
+              setValue('currentPasswordField', event.target.value, { shouldValidate: true });
+            }}
           />
           <div className={`input-error ${errors.currentPasswordField ? '' : 'invisible'}`}>
             {errors.currentPasswordField?.message || ' '}
@@ -86,15 +81,18 @@ const ChangePassword = () => {
           <input
             {...register('newPasswordField', {
               required: 'Choose a new password',
-              validate: validateNewPassword,
+              validate: validateWalletPassword,
             })}
             className={`w-100 custom-label ${errors.newPasswordField ? 'custom-label-error' : ''}`}
             placeholder="New password"
             type="password"
             value={newPassword}
-            onChange={(event) => setNewPassword(event.target.value)}
+            onChange={(event) => {
+              setNewPassword(event.target.value);
+              setValue('newPasswordField', event.target.value, { shouldValidate: true });
+            }}
           />
-          <div className={`input-error ${errors.newPasswordField ? '' : 'invisible'}`}>
+          <div className={`input-error long-error-message ${errors.newPasswordField ? '' : 'invisible'}`}>
             {errors.newPasswordField?.message || ' '}
           </div>
         </div>
@@ -111,7 +109,10 @@ const ChangePassword = () => {
             placeholder="Repeat new password"
             type="password"
             value={confirmPassword}
-            onChange={(event) => setConfirmPassword(event.target.value)}
+            onChange={(event) => {
+              setConfirmPassword(event.target.value);
+              setValue('confirmPasswordField', event.target.value, { shouldValidate: true });
+            }}
           />
           <div className={`input-error ${errors.confirmPasswordField ? '' : 'invisible'}`}>
             {errors.confirmPasswordField?.message || ' '}

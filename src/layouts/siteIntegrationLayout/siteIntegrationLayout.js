@@ -3,13 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import { useSelector } from 'react-redux';
 import { Primitives, Zenon, utils as sdkUtils } from 'znn-ts-sdk';
 
+import TokenAmount from '../../components/token-amount/token-amount';
+import { authorizationMetadata, normalizeBaseUnits } from '../../services/wallet/tokenMetadata';
 import useAccount from '../../services/hooks/useAccount';
 import useBlockSender from '../../services/hooks/useBlockSender';
 import vault from '../../services/wallet/vault';
 import { signMessage } from '../../services/wallet/signMessage';
 import { sendInternal } from '../../services/utils/messaging';
 import {
-  formatAmount,
   formatExact,
   toBigNumber,
   truncateAddress,
@@ -46,9 +47,8 @@ const hostOf = (origin) => {
 // build cannot decode has to look like a warning rather than like an ordinary
 // approval, because "unknown" is exactly the case where reading the raw data
 // below is not optional.
-const describeBlock = (json, tokenFor) => {
+const describeBlock = (json) => {
   const contract = embeddedContractName(json?.toAddress);
-  const entry = tokenFor(json?.tokenStandard);
   const amount = json?.amount;
   const hasAmount = Boolean(amount) && amount !== '0';
 
@@ -58,8 +58,6 @@ const describeBlock = (json, tokenFor) => {
       to: json?.toAddress,
       amount,
       hasAmount,
-      decimals: entry?.token?.decimals,
-      symbol: entry?.token?.symbol,
       tokenStandard: json?.tokenStandard,
     };
   }
@@ -73,8 +71,6 @@ const describeBlock = (json, tokenFor) => {
     label: method ? describeCall(contract, method) : null,
     amount,
     hasAmount,
-    decimals: entry?.token?.decimals,
-    symbol: entry?.token?.symbol,
     tokenStandard: json?.tokenStandard,
   };
 };
@@ -257,10 +253,12 @@ const SiteIntegrationLayout = () => {
 
     try {
       const { to, tokenStandard, amount } = request.params;
+      authorizationMetadata(tokenStandard);
+      const units = normalizeBaseUnits(amount);
       const template = Primitives.AccountBlockTemplate.send(
         Primitives.Address.parse(to),
         Primitives.TokenStandard.parse(tokenStandard),
-        amount
+        toBigNumber(units)
       );
       const signed = await send(template);
 
@@ -315,7 +313,11 @@ const SiteIntegrationLayout = () => {
     setIsBusy(true);
 
     try {
-      const template = Primitives.AccountBlockTemplate.fromJson(request.params);
+      authorizationMetadata(request.params.tokenStandard);
+      const template = Primitives.AccountBlockTemplate.fromJson({
+        ...request.params,
+        amount: normalizeBaseUnits(request.params.amount),
+      });
       const signed = await send(template);
 
       await finish(request.id, {
@@ -368,13 +370,23 @@ const SiteIntegrationLayout = () => {
   // plain transfer and an arbitrary block; a contract call with no value has an
   // amount of zero and never trips it.
   const shortfall = (() => {
+    if (!['sendTransaction', 'signAndSendBlock'].includes(request.type)) {
+      return null;
+    }
     const { tokenStandard, amount } = request.params || {};
-    const wanted = toBigNumber(amount);
+    let wanted;
+    let metadata;
+    try {
+      metadata = authorizationMetadata(tokenStandard);
+      wanted = toBigNumber(normalizeBaseUnits(amount));
+    } catch (err) {
+      return 'Invalid amount or token identifier.';
+    }
 
     if (wanted.isZero()) {
       return null;
     }
-    const entry = tokenFor(tokenStandard);
+    const entry = tokenFor(metadata.tokenStandard);
 
     if (!entry) {
       return 'This account holds none of that token.';
@@ -384,10 +396,7 @@ const SiteIntegrationLayout = () => {
     if (!wanted.gt(balance)) {
       return null;
     }
-    return `This account holds only ${formatAmount(
-      balance,
-      entry.token?.decimals
-    )} ${entry.token?.symbol || ''}.`.trim();
+    return `This account holds only ${formatExact(balance, metadata.decimals)} ${metadata.symbol}.`;
   })();
 
   return (
@@ -441,37 +450,9 @@ const SiteIntegrationLayout = () => {
 
             {(() => {
               const { to, tokenStandard, amount } = request.params;
-              // Guarded, unlike before: a token this account holds none of is a
-              // perfectly ordinary request, not a crash.
-              const entry = tokenFor(tokenStandard);
-              const decimals = entry?.token?.decimals;
-              const symbol = entry?.token?.symbol;
-
               return (
                 <dl className="confirm-details">
-                  <dt>Amount</dt>
-                  <dd
-                    title={
-                      decimals !== undefined
-                        ? formatExact(amount, decimals)
-                        : undefined
-                    }
-                  >
-                    {decimals !== undefined ? (
-                      `${formatAmount(amount, decimals)} ${symbol}`
-                    ) : (
-                      <>
-                        {amount?.toString()}{' '}
-                        <span className="text-gray">base units</span>
-                      </>
-                    )}
-                  </dd>
-                  {decimals === undefined && (
-                    <>
-                      <dt>Token</dt>
-                      <dd className="word-break-all">{tokenStandard}</dd>
-                    </>
-                  )}
+                  <TokenAmount amount={amount} tokenStandard={tokenStandard} />
                   <dt>To</dt>
                   <dd className="word-break-all">{to}</dd>
                   <dt>From</dt>
@@ -482,7 +463,7 @@ const SiteIntegrationLayout = () => {
 
             {shortfall && (
               <p className="approval-warning" role="alert">
-                Not enough balance for this transfer. {shortfall}
+                {shortfall}
               </p>
             )}
           </div>
@@ -554,27 +535,9 @@ const SiteIntegrationLayout = () => {
 
             {(() => {
               const json = preview ?? request.params;
-              const info = describeBlock(json, tokenFor);
+              const info = describeBlock(json);
               const amountRow = info.hasAmount && (
-                <>
-                  <dt>Amount</dt>
-                  <dd
-                    title={
-                      info.decimals !== undefined
-                        ? formatExact(info.amount, info.decimals)
-                        : undefined
-                    }
-                  >
-                    {info.decimals !== undefined ? (
-                      `${formatAmount(info.amount, info.decimals)} ${info.symbol}`
-                    ) : (
-                      <>
-                        {info.amount?.toString()}{' '}
-                        <span className="text-gray">base units</span>
-                      </>
-                    )}
-                  </dd>
-                </>
+                <TokenAmount amount={info.amount} tokenStandard={info.tokenStandard} />
               );
 
               if (info.kind === 'unknownCall') {
@@ -642,7 +605,7 @@ const SiteIntegrationLayout = () => {
 
             {shortfall && (
               <p className="approval-warning" role="alert">
-                Not enough balance for this block. {shortfall}
+                {shortfall}
               </p>
             )}
           </div>

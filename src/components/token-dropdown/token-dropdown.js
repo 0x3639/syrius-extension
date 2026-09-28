@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
+import { authorizationMetadata } from '../../services/wallet/tokenMetadata';
 import { formatAmount, truncateAddress } from '../../services/utils/format';
 
 // The token select.
@@ -39,6 +40,7 @@ const TokenDropdown = React.forwardRef(
     }, [isOpen, onBlur]);
 
     const selected = selectedIndex >= 0 ? options[selectedIndex] : null;
+    const selectedMetadata = selected ? authorizationMetadata(selected.token.tokenStandard) : null;
 
     return (
       <div className={`Dropdown-root ${isOpen ? 'is-open' : ''}`} ref={rootRef}>
@@ -53,9 +55,9 @@ const TokenDropdown = React.forwardRef(
         >
           {selected ? (
             <span className="token-option">
-              <span className="token-option-symbol">{selected.token?.symbol}</span>
+              <span className="token-option-symbol">{selectedMetadata.isNative ? selectedMetadata.symbol : 'Custom token'}</span>
               <span className="token-option-balance">
-                {formatAmount(selected.balance, selected.token?.decimals)}
+                {formatAmount(selected.balance, selectedMetadata.decimals)}{selectedMetadata.isNative ? '' : ' base units'}
               </span>
             </span>
           ) : (
@@ -68,6 +70,7 @@ const TokenDropdown = React.forwardRef(
           <div className="Dropdown-menu">
             {options.map((option, index) => {
               const zts = option?.token?.tokenStandard?.toString() || '';
+              const metadata = authorizationMetadata(zts);
 
               return (
                 <div
@@ -79,10 +82,10 @@ const TokenDropdown = React.forwardRef(
                   }}
                 >
                   <span className="token-option">
-                    <span className="token-option-symbol">{option.token?.symbol || '?'}</span>
+                    <span className="token-option-symbol">{metadata.isNative ? metadata.symbol : 'Custom token'}</span>
                     <span className="token-option-standard">{truncateAddress(zts, 8, 4)}</span>
                     <span className="token-option-balance">
-                      {formatAmount(option.balance, option.token?.decimals)}
+                      {formatAmount(option.balance, metadata.decimals)}{metadata.isNative ? '' : ' base units'}
                     </span>
                   </span>
                 </div>

@@ -2,11 +2,11 @@ import React, { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useDispatch } from 'react-redux';
 import { useForm } from 'react-hook-form';
-import { KeyStore, KeyStoreManager } from 'znn-ts-sdk';
+import { KeyStore } from 'znn-ts-sdk';
 
 import NavBack from '../../components/nav-back/nav-back';
 import ProgressSteps from '../../components/progress-steps/progress-steps';
-import fallbackValues from '../../services/utils/fallbackValues';
+import { validateWalletPassword, saveWalletWithPassword } from '../../services/wallet/password';
 import { loadStorageWalletNames, sanitizeWalletName } from '../../services/utils/utils';
 import { notify } from '../../services/utils/notify';
 import { completeUnlock } from '../../services/wallet/bootstrap';
@@ -43,8 +43,6 @@ const Recovery = () => {
     formState: { errors },
     setValue,
   } = useForm();
-
-  const { strongRegex, passwordCriteria } = fallbackValues.passwordValidationInfo;
 
   // Recomputed as it is typed so the message can say what is actually wrong,
   // rather than "Invalid mnemonic" for every case.
@@ -86,7 +84,7 @@ const Recovery = () => {
       const store = new KeyStore().fromMnemonic(normalise(phrase));
       const storageName = sanitizeWalletName(walletName);
       // Awaited, unlike before.
-      await new KeyStoreManager().saveKeyStore(store, password, storageName);
+      await saveWalletWithPassword(store, password, storageName);
 
       await completeUnlock({ walletName: storageName, password, dispatch });
       notify.success('Wallet imported');
@@ -159,7 +157,7 @@ const Recovery = () => {
             <input
               {...register('passwordField', {
                 required: true,
-                validate: (value) => strongRegex.test(value) || passwordCriteria,
+                validate: validateWalletPassword,
               })}
               className={`w-100 custom-label ${errors.passwordField ? 'custom-label-error' : ''}`}
               placeholder="Password"

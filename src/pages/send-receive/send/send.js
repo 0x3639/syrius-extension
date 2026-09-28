@@ -1,8 +1,10 @@
-import React, { useContext, useEffect, useMemo, useState } from 'react';
+import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Primitives } from 'znn-ts-sdk';
 import { useForm } from 'react-hook-form';
 
+import TokenAmount from '../../../components/token-amount/token-amount';
+import { authorizationMetadata, parseTransferAmount, prepareTransfer } from '../../../services/wallet/tokenMetadata';
 import AlertModal from '../../../components/modals/alert-modal';
 import ControlledDropdown from '../../../components/custom-dropdown/controlled-dropdown';
 import { ModalContext } from '../../../services/hooks/modal/modalContext';
@@ -11,7 +13,6 @@ import useBackgroundSender from '../../../services/hooks/useBackgroundSender';
 import {
   formatAmount,
   formatExact,
-  parseAmount,
   toBigNumber,
 } from '../../../services/utils/format';
 import { notify } from '../../../services/utils/notify';
@@ -58,8 +59,9 @@ const Send = () => {
   } = useForm({ mode: 'onChange' });
 
   const selected = balanceMap[selectedToken];
-  const decimals = selected?.token?.decimals;
-  const symbol = selected?.token?.symbol || '';
+  const { decimals, symbol, isNative } = authorizationMetadata(selectedToken);
+  const current = useRef();
+  current.current = { address, selectedToken, balanceMap };
 
   // Through `toBigNumber`, because a balance reaches here as a BigNumber from
   // the node, as the number 0 from the placeholder token map, or as undefined
@@ -78,10 +80,10 @@ const Send = () => {
   // Comparing base units rather than parsed floats, so a balance that a double
   // cannot represent still validates correctly.
   const validateAmount = (input) => {
-    const parsed = parseAmount(input, decimals);
+    const parsed = parseTransferAmount(input, selectedToken);
 
     if (parsed === null) {
-      return `Enter an amount with at most ${decimals ?? 8} decimals`;
+      return isNative ? `Enter an amount with at most ${decimals} decimals` : 'Enter an integer number of base units';
     }
     if (parsed.isZero()) {
       return 'Amount must be more than zero';
@@ -120,36 +122,38 @@ const Send = () => {
   // proof of work on an account with no fused plasma, and the wallet used to
   // spend them behind a modal spinner on this screen. The block goes off to the
   // background sender, the form empties, and the dashboard reports the rest.
-  const submit = () => {
-    // Checked again here, not just in the form. The confirmation modal sits
-    // between validation and this, and a balance can move underneath it — a
-    // pending send landing is enough.
-    const problem = validateAmount(amount);
-
-    if (problem !== true) {
-      notify.error(problem);
+  const submit = (review) => {
+    // A metadata refresh cannot reinterpret an already reviewed quantity.
+    // An account or token selection change requires another confirmation.
+    if (current.current.address !== review.owner || current.current.selectedToken !== review.tokenStandard) {
+      notify.error('The account or token changed. Review this transfer again.');
       return;
     }
-
     try {
-      const parsed = parseAmount(amount, decimals);
-      const toAddress = Primitives.Address.parse(recipient.trim());
-      const tokenStandard = Primitives.TokenStandard.parse(selectedToken);
-      const template = Primitives.AccountBlockTemplate.send(toAddress, tokenStandard, parsed);
+      const parsed = toBigNumber(review.amount);
+      const latestBalance = current.current.balanceMap[review.tokenStandard]?.balance;
+      if (parsed.gt(toBigNumber(latestBalance))) {
+        throw new Error('Not enough balance for this transfer');
+      }
+      const template = Primitives.AccountBlockTemplate.send(
+        Primitives.Address.parse(review.recipient),
+        Primitives.TokenStandard.parse(review.tokenStandard),
+        parsed
+      );
 
       sendInBackground(template, {
-        successMessage: `Sent ${amount} ${symbol}`,
+        successMessage: `Sent ${formatExact(review.amount, review.decimals)} ${review.symbol}`,
         // What the dashboard needs to draw the row, since the block will not be
         // in the account's history until this finishes.
         row: {
           // Which account this belongs to, so switching address does not show
           // a send made from the previous one. The type, glyph and destination
           // come off the template.
-          owner: address,
+          owner: review.owner,
           label: 'Sending',
           amount: parsed.toString(),
-          decimals,
-          tokenSymbol: symbol,
+          decimals: review.decimals,
+          tokenSymbol: review.symbol,
         },
       });
 
@@ -165,28 +169,35 @@ const Send = () => {
   };
 
   const confirm = () => {
-    openModal(
-      <AlertModal
-        type="confirm"
-        title="Confirm send"
-        confirmLabel="Send"
-        onSuccess={submit}
-      >
-        <dl className="confirm-details">
-          <dt>Amount</dt>
-          <dd>
-            {amount} {symbol}
-          </dd>
-          <dt>To</dt>
-          <dd className="word-break-all">{recipient.trim()}</dd>
-        </dl>
-      </AlertModal>
-    );
+    try {
+      const review = prepareTransfer({ tokenStandard: selectedToken, amount, recipient, owner: address, balance });
+      openModal(
+        <AlertModal
+          type="confirm"
+          title="Confirm send"
+          confirmLabel="Send"
+          onSuccess={() => submit(review)}
+        >
+          <dl className="confirm-details">
+            <TokenAmount amount={review.amount} tokenStandard={review.tokenStandard} />
+            <dt>To</dt>
+            <dd className="word-break-all">{review.recipient}</dd>
+          </dl>
+        </AlertModal>
+      );
+    } catch (err) {
+      notify.error(err);
+    }
   };
 
   return (
     <div className="page">
       <form onSubmit={handleSubmit(confirm)}>
+        {!isNative && (
+          <p className="approval-warning">
+            Custom token details are unverified. Enter whole base units and check the full token identifier at confirmation.
+          </p>
+        )}
         <div className="custom-control">
           <ControlledDropdown
             dropdownComponent="TokenDropdown"
@@ -213,7 +224,7 @@ const Send = () => {
               className={`w-100 custom-label pr-3 ${
                 errors.sendAmountField ? 'custom-label-error' : ''
               }`}
-              placeholder={`${symbol || 'Token'} amount`}
+              placeholder={isNative ? `${symbol} amount` : 'Base units (integer)'}
               value={amount}
               onChange={(event) => {
                 setAmount(event.target.value);
